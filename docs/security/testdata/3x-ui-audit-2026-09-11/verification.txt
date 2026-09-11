@@ -1,0 +1,37 @@
+3x-ui source audit verification record
+Date: 2026-09-11
+Source tag: v3.7.0
+Source commit: f727d04f6522bb94a8fb52e8352fdcafb51c11e1
+
+Scope: stdlib-only extracted-function probe. This is NOT a full panel,
+Docker, subscription HTTP routing, Linux permission, or Xray runtime test.
+The extraction copies the original doFetchSubscriptionLinks / decoder /
+isHTTPURL functions and the original netsafe dialer. Only package/import
+wiring is adapted. The extract_probe.py script records how to regenerate it.
+
+Both httptest servers bind loopback only. No real internal service, cloud
+metadata endpoint, or public target was probed.
+
+Command (PowerShell, evidence directory):
+  & 'D:\Python\Python314\python.exe' extract_probe.py
+  $env:GOTOOLCHAIN = 'local'
+  & 'C:\Users\zhang\.codex\tools\go1.26.6\bin\go.exe' test -v external_probe.go netsafe_probe.go external_probe_test.go
+
+Observed output, exit code 0:
+=== RUN   TestExternalSubscriptionReachesLoopback
+    external_probe_test.go:28: actual external-subscription functions accepted and fetched a loopback URL
+--- PASS: TestExternalSubscriptionReachesLoopback (0.00s)
+=== RUN   TestExternalSubscriptionFollowsRedirectToLoopback
+    external_probe_test.go:44: redirect followed to second loopback server; both servers stayed local
+--- PASS: TestExternalSubscriptionFollowsRedirectToLoopback (0.00s)
+=== RUN   TestExistingGuardRejectsSameLoopbackTarget
+    external_probe_test.go:57: existing netsafe guard rejects identical target; external fetch does not use it
+--- PASS: TestExistingGuardRejectsSameLoopbackTarget (0.00s)
+PASS
+ok      command-line-arguments   1.658s
+
+Interpretation: the first two PASS results reproduce the reachability gap.
+They do not indicate that the application is secure. The third test confirms
+that the repository's existing guarded dialer rejects the same local target.
+The full route permissions and administrator-configured URL prerequisites
+were checked statically, not through a running application.
