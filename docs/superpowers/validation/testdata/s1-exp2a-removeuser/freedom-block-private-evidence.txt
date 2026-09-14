@@ -1,0 +1,3 @@
+15:2026/09/14 15:05:51.298301 [Info] [4077687671] proxy/vless/inbound: received request for tcp:127.0.0.1:18080
+18:2026/09/14 15:05:51.298301 [Info] [4077687671] app/dispatcher: default route for tcp:127.0.0.1:18080
+19:2026/09/14 15:05:51.298301 [Info] [4077687671] proxy/freedom: blocked target: tcp:127.0.0.1:18080, blackholing connection for 1m17s

@@ -2,7 +2,9 @@
 
 交接日期：2026-09-11。来源：Codex 任务 `xray`，ID `01a07ae9-e79d-7b01-9fcd-31594bea3acf`。
 
-本文件是原讨论的聚焦摘要，用来补充分叉历史，并在后续上下文压缩后保留项目约束。当前已完成独立代码目录、上下文准备和用户确认的第一阶段设计，进入实施计划阶段；尚未实现账户管理功能或应用安全补丁。
+本文件是原讨论的聚焦摘要，用来补充分叉历史，并在后续上下文压缩后保留项目约束。
+
+2026-09-14 状态更新：S0 基线验证已执行完毕（[记录](superpowers/validation/2026-09-11-xray-account-baseline.md)），S1 实验 1 与 2a 已执行（[记录](superpowers/validation/2026-09-14-xray-account-s1-experiments.md)）。实验结果**否定了第一版一项隐含前提**——现有 API 无法中断已建立的连接，详见下文「已验证的执行能力事实」。仍未实现账户管理功能，未应用任何安全补丁，未部署。
 
 ## 已确认的第一版目标
 
@@ -59,7 +61,7 @@
 - 一账户下多个代理凭据的用量应汇总到同一个月额度，不能变成每个凭据各享一份完整额度。要处理节点重启、统计清零、重复读取、重复上报和月周期结算。
 - 同一账户在两台代理服务器上同时产生用量时，节点来源分别计量后汇总，不能按 UUID 把两个节点的真实用量误去重，也不能重复计入同一节点的一次上报。节点失联、恢复和部分执行失败需要双节点验证。
 - 定时轮询会有额度超用窗口；若要求严格硬上限，需要节点本地执行预算等额外设计。
-- 额度耗尽需要在实际连接路径生效；不能因为面板调用 `RemoveUser` 或修改 `Enable` 就声称现有连接已停止。验证目标账户新建及已有连接的处理，并确认其他账户不受影响。
+- ~~额度耗尽需要在实际连接路径生效；不能因为面板调用 `RemoveUser` 或修改 `Enable` 就声称现有连接已停止。~~ **2026-09-14 已实测验证，见下节。结论是现有 API 确实不能停止既有连接**，此项从「待验证」转为「已确认的能力缺口」。
 
 以下设备可行性结论保留为历史参考，不是第一版待办：
 
@@ -68,9 +70,28 @@
 - 每设备独立 UUID 有助于统计和选择性撤销，但 UUID 可复制，仍不足以保证严格的物理设备上限。
 - 严格控制需要可靠的设备证明/客户端配合，以及实际连接路径上的准入校验。用户已选择兼容上述通用第三方客户端；在此约束下，严格物理设备识别与准入尚无已验证的实现方案。
 - 多节点环境需要按不同设备原子占用在线名额，并定义断线、重连、休眠、超时回收等规则。不能用网页心跳单独证明代理在线状态。
-- 不能因为面板中调用 `RemoveUser` 或存在注释，就声称已有连接立即断开。要验证目标 Xray 版本的实际行为；踢下线必须验证定向终止及旧会话重连行为。
+- 不能因为面板中调用 `RemoveUser` 或存在注释，就声称已有连接立即断开。要验证目标 Xray 版本的实际行为；踢下线必须验证定向终止及旧会话重连行为。**2026-09-14 已在 `Xray 26.7.28` 上验证：`RemoveUser` 确实不断开既有连接，见「已验证的执行能力事实」。**
 
 目前不能宣称已经找到完全满足“原样使用任意通用客户端且严格限制 10 台物理设备”的现成方案。第一版按用户最新决定排除该功能，不因这项历史需求未实现而阻止第一版验收。
+
+## 已验证的执行能力事实（2026-09-14）
+
+以下四条来自真实核心实测与源码确认，不是推断。证据与边界见 [S1 实验记录](superpowers/validation/2026-09-14-xray-account-s1-experiments.md)。
+
+1. **`RemoveUser` 不中断既有连接。** 固定版本 `Xray 26.7.28` 上，对账户 A 调用 `RemoveUser` 后 20 秒内，A 的既有连接读取 11,468,800 字节（558.3 KiB/s），与未被操作的账户 B 完全相同，逐秒计数在移除那一刻无任何变化。移除本身生效确凿（`inbounduser` 移除后只剩 B，新握手被拒）。VLESS 只在握手时认证一次，`AlterInbound` 在结构上够不到连接。
+2. **被停用账户继续记账、继续显示在线。** 核心中无任何代码调用 `UnregisterCounter`，计数器在 dispatch 时已焊入 link。
+3. **单面板部署无重启兜底。** `restartXrayOnClientDisable` 默认为 `"true"`，但停用客户端走 `RestartXray(false)`，热更成功即提前返回，永不重启进程。`RemoveUser` 就是全部执行手段。多节点 master 另有 `RestartXray(true)` 强制重启路径，未验证，且代价是整机所有账号掉线。
+4. **流量提交失败会静默丢增量。** 每客户端 `UPDATE client_traffics` 失败只记日志、函数仍返回 nil，而内存基线已在提交前推进，下一轮算出的增量为 0。一次瞬时数据库错误即可让一段流量永久消失且无任何错误信号。
+
+**合起来构成一个对共享月额度不利的闭环**：额度耗尽 → 停用 → 连接不断 → 继续跑流量 → 继续记账 → 超用持续扩大，而面板显示一切正常。
+
+因此「额度耗尽即断流」在现有能力上做不到。方向选定前不应开始 S3（共享额度）实现。三个候选方向均未验证：
+
+1. 接受可测量的超用窗口——只挡新连接，配合轮询与明示的延迟上界；
+2. 在连接层扩展准入校验，使既有连接可被定向终止；
+3. 整核心重启——**本文件已明确禁止**，代价是同机所有账号掉线。
+
+顺带确认了一处既有缺陷：`internal/web/job/check_client_ip_job.go:666` 的 IP 超限功能注释写着「Remove user to disconnect all connections」，按上述结论它一条连接都断不了，该功能大概率失效。这正是本文件反复强调的「不能把注释当运行证据」。
 
 ## 安全审查已经完成到什么程度
 
@@ -117,11 +138,42 @@
 - `internal/web/runtime/`：入站/客户端变更应经过此运行时分发，不能绕开多节点路径直接调 Xray。
 - `frontend/src/routes.tsx`、`frontend/src/pages/clients/`、`frontend/src/pages/sub/SubPage.tsx`：已有管理及订阅页面。
 
+## 部署目标的实际状态（2026-09-14 确认）
+
+两台代理服务器**已存在并在服务真实用户**，跑的是官方 `Xray-install` 装的裸 Xray，不是 3x-ui：
+
+| | 机器 A | 机器 B |
+| --- | --- | --- |
+| 系统 | CentOS 7（2024-06-30 EOL） | Debian 9 stretch（LTS 2022-06-30 EOL） |
+| 架构 | x86_64 | x86_64 |
+| systemd `User=` | **root**，降权三行被注释 | `nobody` + `AmbientCapabilities`，已加固 |
+| 布局 | `/usr/local/bin/xray`、`/usr/local/etc/xray/config.json`、`/etc/systemd/system/xray.service` | 同左 |
+| 配置 | 单个 VLESS + REALITY 入站，约 850 字节，含少量客户端 | 同左 |
+
+两台系统均已终止支持，包管理器源已移到 archive/vault，且面向公网。二进制大小不同，说明 Xray 版本不同（未逐一确认版本号）。
+
+**备份已于 2026-09-14 完成并取回本地**，含二进制、配置、systemd unit，哈希已核对。备份中真正不可再生的只有 REALITY 的 `privateKey`——其余字段（客户端 UUID、shortId、serverNames、端口、publicKey）在每个客户端配置里都有副本，唯独私钥只存在于服务器上。丢失即须重发全部客户端配置。
+
+计划拓扑：机器 A 或 B 之一作 master 兼代理，另一台作子节点兼代理。面板暂在本机 Windows，后续迁到服务器。
+
+## 迁移到 3x-ui 的已知约束（2026-09-14 调查）
+
+这些是并行审查得出的结论，重新发现代价很高，故记录于此。
+
+**可以分阶段切换，不必大爆炸。** 全仓库检索确认 `install.sh` 从不读写 `/usr/local/bin/xray`、`/usr/local/etc/xray/`、`xray.service`，也从不停用它们（唯一的 `pkill` 匹配 mtg 侧车）。3x-ui 装在 `/usr/local/x-ui/`，其 Xray 在 `/usr/local/x-ui/bin/`。**唯一硬冲突是端口。** 面板每秒检查 Xray、连续两次失败才重启，因此 `systemctl disable --now xray` 后端口在约 2–3 秒内被接管。
+
+**必须走 API，不能用面板 UI 建这个入站。** `frontend/src/pages/inbounds/form/useSecurityActions.ts` 的 `onSecurityChange` 在 security 下拉框选中 reality 时会删除整个 `realitySettings`、随机化 `shortIds`、清空 `target`/`serverNames`，并**异步**拉取新密钥对覆写 `privateKey` 与 `publicKey`。该请求无防护，粘贴的真实私钥会在响应落地时被静默替换。走 `POST /panel/api/inbounds/add` 则 `streamSettings` 作为不透明字符串原样入库，前端不参与。禁忌动作只有两个：动 security 下拉框、点「获取新证书」。
+
+**导入时每个客户端必须补 `"enable": true` 和非空 `email`。** `model.Client.Enable` 无 gorm 默认值，原生 Xray 配置没有 `enable` 字段，零值 false 会被字面写入 `client_traffics`，生成配置时 `if exists && !enable { continue }` 把每个用户都跳过——结果是 Xray 正常启动、端口与 REALITY 参数都对、**clients 数组为空**，面板显示一切正常，只有一行 info 日志。缺 `email` 的客户端在 `client_link.go` 里 `if email == "" { continue }` 被更早跳过。
+
+**其余已识别的坑**：`install.sh` 的下载 URL 四处硬编码上游 `MHSanaei/3x-ui`，直接运行装的是上游而非本 fork（**尚未决定装哪个**）；重装后防火墙全新，Rocky 9 的 firewalld 默认 enforcing 会让「恢复成功」的服务仍被黑洞，须从机器外验证；`x-ui.sh` 的防火墙菜单硬编码 2053/2096 而非实际随机端口，且 `ufw allow ssh` 只开 22；fail2ban 为 opt-out，其 SSH 端口探测只读 `/etc/ssh/sshd_config` 不读 `sshd_config.d/`；切换收尾必须 `disable --now` 而非 `stop`，否则两个 unit 都 enabled，下次重启抢端口；删除节点的直觉顺序（先删 inbound）会把子节点上的用户一起删掉，正确顺序是先 `SetEnable(false)`；节点 tag 冲突时 adoption 只告警不报错，reconcile 扫描会在数秒后删掉子节点的入站，可用 `InboundSyncMode: selected` 规避。
+
 ## 下一阶段顺序
 
-1. 核实工作目录、分支及固定基线，阅读上述项目指导和安全证据；核实必要上游安全补丁的适用范围。
-2. 按用户已批准的第一阶段设计执行 [S0 基线验证计划](superpowers/plans/2026-09-11-xray-account-baseline-validation.md)，记录构建和既有测试的实际结果；不再重复询问是否批准同一设计。
-3. 在双节点路径优先验证用量记账可靠性及额度耗尽后的账户连接控制，确认断流行为和检测延迟；设备身份验证不再是第一版前置条件。2026-09-11 讨论的 [具体验证方法](superpowers/plans/2026-09-11-xray-account-baseline-validation.md#双节点与定向断流验证方法讨论补充) 已记录，包含已知增量、真实传输、账户 A/B 隔离、故障恢复和证据边界；这些是验证方案，尚未执行。
+1. ~~核实工作目录、分支及固定基线，阅读上述项目指导和安全证据~~ **已完成**。上游安全补丁的适用范围仍未核实。
+2. ~~执行 [S0 基线验证计划](superpowers/plans/2026-09-11-xray-account-baseline-validation.md)~~ **2026-09-14 已完成**，16 个测试全绿、真实核心跑通，见 [S0 记录](superpowers/validation/2026-09-11-xray-account-baseline.md)，提交 `208c122`。
+3. **进行中。** 记账可靠性与定向断流已在单机真实核心上验证完毕（实验 1、2a，见上节「已验证的执行能力事实」）。剩余：实验 3（节点失联收敛，需第二个节点）、UDP / Mux / REALITY / flow 场景、目标 Linux 节点复跑。2026-09-11 记录的 [具体验证方法](superpowers/plans/2026-09-11-xray-account-baseline-validation.md#双节点与定向断流验证方法讨论补充) 仍适用于未覆盖部分。
+   **新增阻塞项**：连接控制方向（超用窗口 / 连接层扩展 / 其他）必须先定下来，否则 S3 无法开工。
 4. 按已明确范围分阶段实现账户隔离、统一流量/月额度及用户界面，配套迁移与真实行为测试。
 5. 以两台代理服务器、20 个账号、20 人同时使用为规模验收目标，记录实际客户端、连接负载、流量及延迟证据；不能用 20 个空闲 TCP 连接代替并发使用验收。
 

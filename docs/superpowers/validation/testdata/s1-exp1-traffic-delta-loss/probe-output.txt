@@ -1,0 +1,12 @@
+﻿=== RUN   TestProbeTrafficDeltaSurvivesFailedCommit
+    traffic_delta_loss_probe_test.go:97: STEP 1  core metered a real delta, handed to the panel: up=500 down=1000
+    traffic_delta_loss_probe_test.go:123: STEP 2  injected 1 client_traffics UPDATE failure(s); AddTraffic returned err=<nil>
+    traffic_delta_loss_probe_test.go:125: STEP 2a SILENT: the write failed but AddTraffic reported success, so the caller has no error to act on
+    traffic_delta_loss_probe_test.go:132: STEP 3  ledger after the failed write: up=0 down=0
+    traffic_delta_loss_probe_test.go:140: STEP 4  re-poll returned 1 entries (baseline already advanced past the lost delta)
+    traffic_delta_loss_probe_test.go:149: STEP 5  final ledger: up=0 down=0
+    traffic_delta_loss_probe_test.go:151: DELTA LOST: ledger holds up=0 down=0 after a failed write plus a healthy re-poll, want up=500 down=1000 (the core did meter 500/1000)
+--- FAIL: TestProbeTrafficDeltaSurvivesFailedCommit (0.12s)
+FAIL
+FAIL	github.com/mhsanaei/3x-ui/v3/internal/web/service	0.839s
+FAIL

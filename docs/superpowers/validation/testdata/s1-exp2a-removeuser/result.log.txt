@@ -1,0 +1,67 @@
+07:08:04  === S1 experiment 2a: RemoveUser vs a live connection ===
+07:08:04  xray      : D:\workspaces\3x-ui\tmp\account-validation\xray.exe
+07:08:04  version   : Xray 26.7.28 (Xray, Penetrates Everything.) Custom (go1.27.0 windows/amd64)
+07:08:04  workdir   : C:\Users\zhang\AppData\Local\Temp\claude\D--workspaces-3x-ui\fb18315e-e7ba-4387-a21e-544e1d0cfc7d\scratchpad\s1probe\run6
+07:08:04  ports     : vless=10443 api=10085 proxyA=10801 proxyB=10802 serve=18080
+07:08:04  ORIGIN got GET /stream from 127.0.0.1:64833 proto=HTTP/1.1
+07:08:04  self-test: origin served 65536 bytes over a direct (unproxied) fetch
+07:08:04  started xray server (pid 16436)
+07:08:04  started xray client (pid 9632)
+07:08:05  both xray processes are up
+07:08:05  ORIGIN got GET /stream from 127.0.0.1:64839 proto=HTTP/1.1
+07:08:05  sanity: user A proxied 65536 bytes
+07:08:05  ORIGIN got GET /stream from 127.0.0.1:64842 proto=HTTP/1.1
+07:08:05  sanity: user B proxied 65536 bytes
+07:08:05  --- observing 6s of steady flow before removal ---
+07:08:05  ORIGIN got GET /stream from 127.0.0.1:64847 proto=HTTP/1.1
+07:08:05  ORIGIN got GET /stream from 127.0.0.1:64848 proto=HTTP/1.1
+07:08:11  inbound users BEFORE removal:
+{
+    "users": [
+        {
+            "account": {
+                "_TypedMessage_": "xray.proxy.vless.Account",
+                "id": "11111111-1111-4111-8111-111111111111"
+            },
+            "email": "alice@probe"
+        },
+        {
+            "account": {
+                "_TypedMessage_": "xray.proxy.vless.Account",
+                "id": "22222222-2222-4222-8222-222222222222"
+            },
+            "email": "bob@probe"
+        }
+    ]
+}
+
+
+07:08:11  >>> calling RemoveUser on alice@probe (the same op 3x-ui issues) <<<
+07:08:11  rmu output: remove user: alice@probe
+Removed 1 user(s) in total.
+07:08:11  inbound users AFTER removal:
+{
+    "users": [
+        {
+            "account": {
+                "_TypedMessage_": "xray.proxy.vless.Account",
+                "id": "22222222-2222-4222-8222-222222222222"
+            },
+            "email": "bob@probe"
+        }
+    ]
+}
+
+
+07:08:11  --- observing 20s after removal ---
+07:08:31  
+07:08:31  === RESULT ===
+07:08:31  in the 20s after RemoveUser:
+07:08:31    user A (REMOVED)     read 11468800 bytes  (558.3 KiB/s)
+07:08:31    user B (untouched)   read 11468800 bytes  (558.3 KiB/s)
+07:08:31  VERDICT: A's EXISTING CONNECTION SURVIVED RemoveUser. B unaffected.
+07:08:31  contrast: a NEW connection as removed user A was REJECTED (EOF) — as expected
+07:08:31  
+07:08:31  evidence: C:\Users\zhang\AppData\Local\Temp\claude\D--workspaces-3x-ui\fb18315e-e7ba-4387-a21e-544e1d0cfc7d\scratchpad\s1probe\run6
+07:08:31    result.log   this transcript
+07:08:31    monitor.log  per-second byte deltas (probe-side) and xray's own per-user counters
