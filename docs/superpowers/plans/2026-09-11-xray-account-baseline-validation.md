@@ -40,7 +40,7 @@
 
 **Interfaces:** 消费当前 Go 模块和基线；产出 Go/CGO/编译器版本、构建退出码及 `tmp/account-validation/x-ui.exe`。后续任务在同一个 PowerShell 会话沿用环境。
 
-- [ ] **Step 1: 核实分支和基线祖先，记录环境。**
+- [x] **Step 1: 核实分支和基线祖先，记录环境。**
 
 ```powershell
 Set-Location -LiteralPath 'D:\workspaces\3x-ui'
@@ -66,7 +66,7 @@ if ($LASTEXITCODE -ne 0) { throw 'C compiler check failed' }
 
 期望：基线是祖先，当前有效 Go 工具链满足 `go.mod` 的 1.27 要求，CGO 为 1。启动器路径中的版本号不能代替 `go version` 结果。环境不满足时先修复本地工具配置并记录，不改项目版本门槛。
 
-- [ ] **Step 2: 按 Makefile 的 dist-stub 语义构建，仅生成后端产物。**
+- [x] **Step 2: 按 Makefile 的 dist-stub 语义构建，仅生成后端产物。**
 
 ```powershell
 New-Item -ItemType Directory -Force -Path 'internal/web/dist' | Out-Null
@@ -85,7 +85,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Backend baseline build failed' }
 
 **Interfaces:** 消费 `XrayAPI.GetTraffic() ([]*Traffic, []*ClientTraffic, error)` 及现有测试夹具；产出每个命名测试的实际结果。模拟 Stats gRPC/节点与临时 SQLite 证据必须分别标注。
 
-- [ ] **Step 1: 执行核心统计差分及 API 参数保护测试。**
+- [x] **Step 1: 执行核心统计差分及 API 参数保护测试。**
 
 ```powershell
 go test -mod=readonly -count=1 -v ./internal/xray -run '^(TestGetTraffic.*|TestRemoveUserGuardsNilHandlerClient)$'
@@ -94,7 +94,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Core statistics baseline failed' }
 
 期望：命中的测试逐个 PASS。首个非空采集建立基线；后出现的计数器按零起点计算；计数器回落有现有处理。这些不证明数据库提交失败后的增量能恢复。
 
-- [ ] **Step 2: 执行双节点同身份汇总、历史导入、重置和运行时分发测试。**
+- [x] **Step 2: 执行双节点同身份汇总、历史导入、重置和运行时分发测试。**
 
 ```powershell
 go test -mod=readonly -count=1 -v ./internal/web/service -run '^(TestTwoNodesShareEmail_SumsCorrectly|TestSingleNode_MirrorsCorrectly|TestNodeAdd_ImportsClientHistoryWithNewInbound|TestUpgrade_PreExistingRow_NoDoubleCount|TestNodeCounterReset_NoReAdd|TestCentralReset_NoReAdd|TestCentralResetClearsNodeBaseline_NoLeak|TestAddTrafficCommitsDespiteDisableHelperError|TestTrafficDisableImmediatelyUpdatesNodeRuntime)$'
@@ -105,7 +105,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Node traffic baseline failed' }
 
 `TestAddTrafficCommitsDespiteDisableHelperError` 验证辅助禁用错误不回滚正常流量，不是数据库写入失败重试测试。`TestTrafficDisableImmediatelyUpdatesNodeRuntime` 验证 mock 调用次数，不是已有连接终止测试。
 
-- [ ] **Step 3: 记录写入顺序和账户模块不能直接依赖的边界。**
+- [x] **Step 3: 记录写入顺序和账户模块不能直接依赖的边界。**
 
 ```powershell
 rg -n 'QueryStats|Reset_: false|StatsLastValues' internal/xray/api.go
@@ -121,7 +121,7 @@ rg -n 'setRemoteTrafficLocked|NodeClientTraffic|Transaction' internal/web/servic
 
 **Interfaces:** 消费现有 `startE2ECore(t *testing.T, inbounds []any) *e2eCore` 及 `XRAY_E2E_BINARY`；产出核心版本/哈希、真实进程测试结果。测试自行创建临时配置并清理它启动的进程。
 
-- [ ] **Step 1: 编译模块固定的核心，记录来源和二进制哈希。**
+- [x] **Step 1: 编译模块固定的核心，记录来源和二进制哈希。**
 
 ```powershell
 go list -mod=readonly -m -json github.com/xtls/xray-core
@@ -136,7 +136,7 @@ $env:XRAY_E2E_BINARY = (Resolve-Path -LiteralPath 'tmp/account-validation/xray.e
 
 期望：模块版本与 `go.mod` 固定值一致，构建无 `go.mod`/`go.sum` 漂移。不得改用 `latest` 二进制绕过失败。
 
-- [ ] **Step 2: 执行 VLESS 用户 API 子测试和实际代理流量测试。**
+- [x] **Step 2: 执行 VLESS 用户 API 子测试和实际代理流量测试。**
 
 ```powershell
 go test -mod=readonly -count=1 -v ./internal/xray -run '^TestXrayAPI_E2E_Users$/^vless$'
@@ -153,7 +153,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Real proxy traffic test failed' }
 
 **Interfaces:** 消费 Tasks 1–3 的实际输出；产出带结果和限制的记录。只记录已执行内容；运行失败保留错误和退出码，未执行写“未运行”及原因，不填写预测结果。
 
-- [ ] **Step 1: 结束记录并核对修改范围。**
+- [x] **Step 1: 结束记录并核对修改范围。**
 
 ```powershell
 Stop-Transcript
@@ -162,13 +162,13 @@ if ($LASTEXITCODE -ne 0) { throw 'Dependency files changed' }
 git status --short
 ```
 
-- [ ] **Step 2: 用实际输出填写验证记录。**
+- [x] **Step 2: 用实际输出填写验证记录。**
 
 记录必须包含：执行日期、完整 HEAD、源码基线、Go/CGO/编译器信息、核心模块版本和 SHA256、构建及各命令退出码、测试名和 PASS/FAIL/SKIP、相关日志摘录。将日志中的测试凭据明确标为测试数据；不提交实际账号、节点密钥或数据库。
 
 结论按“源码已确认”“模拟依赖测试已运行”“真实核心已运行”“尚未覆盖”四类写明，禁止把后两类混在一起。S0 只验证既有基础，不声明计量无损、完整账户断流或 20 人容量达标。
 
-- [ ] **Step 3: 按以下条件确定 S1 实验内容，再展开功能实施计划。**
+- [x] **Step 3: 按以下条件确定 S1 实验内容，再展开功能实施计划。**
 
 | 顺序 | S1 必须新增的行为验证 | 决定什么 |
 | --- | --- | --- |
@@ -178,7 +178,7 @@ git status --short
 
 S1 的详细测试代码和连接控制方案根据 S0 结果另成计划；本计划不预设现有 API 会断开已有连接。若需要新增核心能力，先形成具体接口和行为方案，不以全核心重启或只隐藏订阅替代。
 
-- [ ] **Step 4: 检查并仅提交计划执行记录。**
+- [x] **Step 4: 检查并仅提交计划执行记录。**
 
 ```powershell
 git add -- docs/superpowers/validation/2026-09-11-xray-account-baseline.md docs/superpowers/plans/2026-09-11-xray-account-baseline-validation.md
@@ -254,4 +254,4 @@ MiB 只用于测试样例，1 MiB = 1,048,576 byte，不改变产品 GiB 展示�
 - [x] 路径、现有测试名及核心测试环境变量已从当前源码核对。
 - [x] 区分已有测试、需要新增的实验和完整第一版验收，不把 S0 等同于实现完成。
 - [x] 已确认的开户、月周期、单位和批量额度规则直接沿用；保留设计中尚需实验的执行边界。
-- [x] 本计划没有执行结果；以上任务仍全部未运行。
+- [x] ~~本计划没有执行结果；以上任务仍全部未运行。~~ 已于 2026-09-14 在 `codex/xray-account`（HEAD `1b952e7`）执行完 Task 1–4，实际结果、退出码、证据分类与偏差见 [S0 基线验证记录](../validation/2026-09-11-xray-account-baseline.md)。S0 通过不代表账户系统或双服务器验收完成。
