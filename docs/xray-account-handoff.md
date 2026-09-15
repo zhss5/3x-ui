@@ -4,7 +4,9 @@
 
 本文件是原讨论的聚焦摘要，用来补充分叉历史，并在后续上下文压缩后保留项目约束。
 
-2026-09-14 状态更新：S0 基线验证已执行完毕（[记录](superpowers/validation/2026-09-11-xray-account-baseline.md)），S1 实验 1 与 2a 已执行（[记录](superpowers/validation/2026-09-14-xray-account-s1-experiments.md)）。实验结果**否定了第一版一项隐含前提**——现有 API 无法中断已建立的连接，详见下文「已验证的执行能力事实」。仍未实现账户管理功能，未应用任何安全补丁，未部署。
+2026-09-14 状态更新：S0 基线验证已执行完毕（[记录](superpowers/validation/2026-09-11-xray-account-baseline.md)），S1 实验 1 与 2a 已执行（[记录](superpowers/validation/2026-09-14-xray-account-s1-experiments.md)）。实验结果**否定了第一版一项隐含前提**——现有 API 无法中断已建立的连接，详见下文「已验证的执行能力事实」。仍未实现账户管理功能，未应用任何安全补丁。
+
+2026-09-15 状态更新：机器 A（`vm44212`）已重装为 Ubuntu 24.04、裸 Xray 已从备份恢复并经真实用户验证、3x-ui v3.7.0 已安装并加固。**入站尚未导入，用户仍由裸 Xray 服务。** 详见下文「机器 A 迁移进度」。机器 B 未动。
 
 ## 已确认的第一版目标
 
@@ -138,19 +140,21 @@
 - `internal/web/runtime/`：入站/客户端变更应经过此运行时分发，不能绕开多节点路径直接调 Xray。
 - `frontend/src/routes.tsx`、`frontend/src/pages/clients/`、`frontend/src/pages/sub/SubPage.tsx`：已有管理及订阅页面。
 
-## 部署目标的实际状态（2026-09-14 确认）
+## 部署目标的实际状态（2026-09-15 更新）
 
-两台代理服务器**已存在并在服务真实用户**，跑的是官方 `Xray-install` 装的裸 Xray，不是 3x-ui：
+两台代理服务器**已存在并在服务真实用户**，服务用户的都是官方 `Xray-install` 装的裸 Xray。机器 A 上已额外安装 3x-ui，但尚未接管流量（见「机器 A 迁移进度」）。
 
-| | 机器 A | 机器 B |
+| | 机器 A `vm44212` / 38.59.228.104 | 机器 B `vm25394` |
 | --- | --- | --- |
-| 系统 | CentOS 7（2024-06-30 EOL） | Debian 9 stretch（LTS 2022-06-30 EOL） |
+| 系统 | ~~CentOS 7~~ → **Ubuntu 24.04.5 LTS**（2026-09-15 重装，内核 6.17，13.49 GB 磁盘） | Debian 9 stretch（LTS 2022-06-30 EOL），**未动** |
 | 架构 | x86_64 | x86_64 |
-| systemd `User=` | **root**，降权三行被注释 | `nobody` + `AmbientCapabilities`，已加固 |
+| systemd `User=` | 恢复自备份，仍是 **root**，降权三行被注释（待加固） | `nobody` + `AmbientCapabilities`，已加固 |
 | 布局 | `/usr/local/bin/xray`、`/usr/local/etc/xray/config.json`、`/etc/systemd/system/xray.service` | 同左 |
-| 配置 | 单个 VLESS + REALITY 入站，约 850 字节，含少量客户端 | 同左 |
+| 入站 | VLESS / 443 / REALITY / **flow=`xtls-rprx-vision`** / dest=`www.apple.com:443` / serverNames=`["www.apple.com"]` / shortIds=`["38796120a33722e7"]` / **1 个客户端，无 `email` 字段** | 未逐项确认 |
 
-两台系统均已终止支持，包管理器源已移到 archive/vault，且面向公网。二进制大小不同，说明 Xray 版本不同（未逐一确认版本号）。
+机器 B 仍是 EOL 系统、包管理器源已移到 archive、面向公网。两台的 Xray 二进制大小不同，说明版本不同（未逐一确认版本号）。
+
+**机器 A 的 REALITY `privateKey` 基准哈希：`2a876c1641027973`**（sha256 前 16 位）。迁移到面板后必须复核这个值不变——这是"客户端配置无需更改"的唯一判据。
 
 **备份已于 2026-09-14 完成并取回本地**，含二进制、配置、systemd unit，哈希已核对。备份中真正不可再生的只有 REALITY 的 `privateKey`——其余字段（客户端 UUID、shortId、serverNames、端口、publicKey）在每个客户端配置里都有副本，唯独私钥只存在于服务器上。丢失即须重发全部客户端配置。
 
@@ -167,6 +171,35 @@
 **导入时每个客户端必须补 `"enable": true` 和非空 `email`。** `model.Client.Enable` 无 gorm 默认值，原生 Xray 配置没有 `enable` 字段，零值 false 会被字面写入 `client_traffics`，生成配置时 `if exists && !enable { continue }` 把每个用户都跳过——结果是 Xray 正常启动、端口与 REALITY 参数都对、**clients 数组为空**，面板显示一切正常，只有一行 info 日志。缺 `email` 的客户端在 `client_link.go` 里 `if email == "" { continue }` 被更早跳过。
 
 **其余已识别的坑**：`install.sh` 的下载 URL 四处硬编码上游 `MHSanaei/3x-ui`，直接运行装的是上游而非本 fork（**尚未决定装哪个**）；重装后防火墙全新，Rocky 9 的 firewalld 默认 enforcing 会让「恢复成功」的服务仍被黑洞，须从机器外验证；`x-ui.sh` 的防火墙菜单硬编码 2053/2096 而非实际随机端口，且 `ufw allow ssh` 只开 22；fail2ban 为 opt-out，其 SSH 端口探测只读 `/etc/ssh/sshd_config` 不读 `sshd_config.d/`；切换收尾必须 `disable --now` 而非 `stop`，否则两个 unit 都 enabled，下次重启抢端口；删除节点的直觉顺序（先删 inbound）会把子节点上的用户一起删掉，正确顺序是先 `SetEnable(false)`；节点 tag 冲突时 adoption 只告警不报错，reconcile 扫描会在数秒后删掉子节点的入站，可用 `InboundSyncMode: selected` 规避。
+
+## 机器 A 迁移进度（2026-09-15）
+
+用户已重装系统并按下列顺序推进。**尚未导入入站，用户仍全程由裸 Xray 在 443 上服务，pid 1337 自始至终未变。**
+
+已完成：
+
+1. **系统重装** CentOS 7 → Ubuntu 24.04.5 LTS。
+2. **裸 Xray 从备份恢复**，`systemctl is-enabled` 为 `enabled`，**真实用户已验证可连可用**——这同时证明备份里的 REALITY 私钥完整无损，整条「备份 → 重装 → 恢复」退路走通。
+3. **3x-ui v3.7.0 安装完成**。装的是上游 `MHSanaei/3x-ui` 的 release，因为本 fork 相对 v3.7.0 **没有任何代码改动**（除 docs 与 `AGENTS.md`），二者在代码上等价。版本用 `bash install.sh v3.7.0` 显式钉死——不能用 latest，否则 S0/S1 的全部证据链失效。
+4. 面板绑 `127.0.0.1:24476`，SQLite，fail2ban 跳过，`/etc/x-ui` 改 700、db 改 600。
+5. **订阅服务器已关闭**（`subEnable=false`），`*:2096` 不再监听。
+6. **公网唯一暴露端口现在只有 443**（裸 Xray），其余全在回环。
+
+未完成：**入站尚未导入**（Step 4 生成 payload 还没开始）。后续步骤为：生成 payload → `POST /panel/api/inbounds/add` 到临时端口 44300 → 测试客户端验证 → 复核 privateKey 哈希与 `clients=1` → `systemctl disable --now xray` → 面板入站端口改 443 → 真实客户端验证。
+
+转换脚本见 [`superpowers/tools/make-inbound-payload.py`](superpowers/tools/make-inbound-payload.py)：在节点上读 `config.json`、生成 `/panel/api/inbounds/add` 所需的 payload（`settings`/`streamSettings`/`sniffing` 需为转义字符串），自动补 `enable:true` 与缺失的 `email`，拒绝使用当前生效端口，并打印脱敏预览（私钥与 UUID 只显示长度和 sha256 前 16 位）。机器 B 迁移时复用同一脚本。
+
+### 过程中踩到并确认的操作性事实
+
+- **`/usr/bin/x-ui` 是 shell 包装脚本，不接受 `setting` 子命令**（它自己的子命令表里是 `settings` 复数）。CLI 必须用二进制全路径 `/usr/local/x-ui/x-ui setting ...`。包装脚本内部也一律这么调。
+- **交互式安装的端口输入不支持方向键**，转义序列会被原样吃进参数。而 `install.sh:1217` 是把 username/password/port/webBasePath **四项放在一条命令**里设的，Go 的 flag 是 `ExitOnError`——端口解析失败会让整条退出，**四项一个都不生效**，面板于是停留在编译内置默认值 `admin`/`admin`、端口 2053、webBasePath `/`。安装摘要打印的却是它**打算**设置的值，具有误导性。绑回环之所以仍然生效，是因为 `install.sh:993` 是一次独立调用。
+- **非交互模式强制不绑回环**（`install.sh:986-987` `bind_local="n"`，注释称云镜像需保持公网可达），必须装完手工补 `-listenIP 127.0.0.1`。
+- **`x-ui uninstall` 会 `rm /etc/x-ui/ -rf`**（连数据库和全部 API token 一起删），且 `x-ui.sh` 全文对裸 Xray 的三个路径零引用——所以卸载重装不会碰 443 上那个。确认提示里的 "xray will also uninstalled" 指的是面板自带的那份。
+- **`POST /panel/api/setting/update` 是全量覆盖**：它绑定整个 `AllSetting` 并调 `UpdateAllSetting`。只发单个键会把其余字段写成 Go 零值。正确用法是 `POST /setting/all` 导出 → 改一处 → 整份发回，服务端的 `preserveRedactedSecrets` 支持这种往返。
+- **删除 API token 需要 `expectedScope` 参数**（`admin` / `monitor` / `node-sync`，见 `api_token.go:55-66`），空值会被 `requireExpectedScope` 拒绝。安装创建的 token 名为 `install`、scope 为 `admin`。
+- **`-getApiToken` 重复调用不会吊销安装时那个 token**：已有 token 时它只重建一个名为 CLI fallback 的**另一个** token（`main.go:511-525`）。要作废 `install` 那个必须显式删除，或卸载重装。
+- **面板密码受 bcrypt 72 字节硬限制**（`golang.org/x/crypto@v0.55.0/bcrypt.go:96` 返回 `ErrPasswordTooLong`，不是截断）。用户名/密码除非空外无任何校验。
+- **客户端 `email` 必须标识人而不是机器**。共享额度按 email 跨节点聚合（S0 的 `TestTwoNodesShareEmail_SumsCorrectly` 即此语义）。若按节点命名，同一个人在两台机器上会变成两个独立账户、各享一份额度——正是本文件禁止的。机器 A 现有客户端没有 email 字段，导入时必须补，取值需在此刻定好。
 
 ## 下一阶段顺序
 
