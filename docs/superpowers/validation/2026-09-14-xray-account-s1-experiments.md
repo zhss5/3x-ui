@@ -161,6 +161,8 @@ case "vless", "vmess", "trojan", "hysteria", "wireguard":
 - **实验 3**：节点失联时调额/停用、恢复后收敛、旧指令迟到——需第二个节点，未执行。
 - 目标 Linux 节点上的复跑（本次为 Windows）。
 - VLESS + REALITY、XTLS Vision/flow、UDP、Mux 下的断流行为。Vision splice 另有两个已知复杂性：空闲计时器被推到 24 小时，且计数器只在连接结束时结算——届时计数器不能作为存活判据。
+
+  **2026-09-16 补充的版本限定（重要）**：上述 Vision splice 行为是 `XTLS Vision: Defer Splice handoff until write completes`（PR #5737）引入的，该提交随 **v26.3.27** 发布。因此它适用于面板管理的 Xray **26.7.28**，而**不适用于机器 A 上当前仍在 443 服务真实用户的裸 Xray 26.2.6**。换言之：切换到面板 Xray 之后，流量计量的可观测特性会真的发生变化（下行计数器在 spliced 传输期间冻结、关闭时一次性结算），而现在还没有。此前未区分版本的表述范围过宽。另外 splice 仅在 Linux/Android 且内层为 TLS 1.3 时才触发，非该条件下退回 readV，计数照常连续。
 - 多节点 master 的 `RestartXray(true)` 强制重启路径及其误伤范围。
 - 真实数据库故障（非注入）下的行为。
 - 20 账号 / 20 人并发容量。

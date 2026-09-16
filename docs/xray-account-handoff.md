@@ -6,7 +6,9 @@
 
 2026-09-14 状态更新：S0 基线验证已执行完毕（[记录](superpowers/validation/2026-09-11-xray-account-baseline.md)），S1 实验 1 与 2a 已执行（[记录](superpowers/validation/2026-09-14-xray-account-s1-experiments.md)）。实验结果**否定了第一版一项隐含前提**——现有 API 无法中断已建立的连接，详见下文「已验证的执行能力事实」。仍未实现账户管理功能，未应用任何安全补丁。
 
-2026-09-15 状态更新：机器 A（`vm44212`）已重装为 Ubuntu 24.04、裸 Xray 已从备份恢复并经真实用户验证、3x-ui v3.7.0 已安装并加固。**入站尚未导入，用户仍由裸 Xray 服务。** 详见下文「机器 A 迁移进度」。机器 B 未动。
+2026-09-15 状态更新：机器 A（`vm44212`）已重装为 Ubuntu 24.04、裸 Xray 已从备份恢复并经真实用户验证、3x-ui v3.7.0 已安装并加固。详见下文「机器 A 迁移进度」。
+
+2026-09-16 状态更新：机器 A 的入站已导入面板并用约 4 MB 真实流量验证通过（临时端口 44300）。**但切换到 443 已决定延后**——面板的 Xray 26.7.28 带 REALITY `minClientVer` 默认门槛，实测挡住了旧版 v2rayN 与 **Shadowrocket**，而后者是本文件已确认要求兼容的四个客户端之一。详见「客户端兼容性硬约束」。用户仍由裸 Xray 26.2.6 在 443 服务，状态安全可逆。机器 B 因服务商面板故障暂时无法重装，已定位原因。
 
 ## 已确认的第一版目标
 
@@ -140,7 +142,7 @@
 - `internal/web/runtime/`：入站/客户端变更应经过此运行时分发，不能绕开多节点路径直接调 Xray。
 - `frontend/src/routes.tsx`、`frontend/src/pages/clients/`、`frontend/src/pages/sub/SubPage.tsx`：已有管理及订阅页面。
 
-## 部署目标的实际状态（2026-09-15 更新）
+## 部署目标的实际状态（2026-09-16 更新）
 
 两台代理服务器**已存在并在服务真实用户**，服务用户的都是官方 `Xray-install` 装的裸 Xray。机器 A 上已额外安装 3x-ui，但尚未接管流量（见「机器 A 迁移进度」）。
 
@@ -152,7 +154,13 @@
 | 布局 | `/usr/local/bin/xray`、`/usr/local/etc/xray/config.json`、`/etc/systemd/system/xray.service` | 同左 |
 | 入站 | VLESS / 443 / REALITY / **flow=`xtls-rprx-vision`** / dest=`www.apple.com:443` / serverNames=`["www.apple.com"]` / shortIds=`["38796120a33722e7"]` / **1 个客户端，无 `email` 字段** | 未逐项确认 |
 
-机器 B 仍是 EOL 系统、包管理器源已移到 archive、面向公网。两台的 Xray 二进制大小不同，说明版本不同（未逐一确认版本号）。
+机器 B 仍是 EOL 系统、包管理器源已移到 archive、面向公网。
+
+**Xray 版本（2026-09-16 确认）**：机器 A 的裸 Xray 是 **26.2.6**（`12ee51e` / go1.25.7），面板管理的那个是 **26.7.28**（`5ca6f4b` / go1.26.5）。这个版本差是当前阻塞切换的根源，见「客户端兼容性硬约束」。机器 B 的版本未确认。
+
+**机器 B 目前无法重装系统**：服务商（hmbcloud）的 WHMCS 面板 VPS 管理区空白。已定位到具体原因——`clientarea.php?action=productdetails&id=5973&api=json&act=vpsmanage` 返回 HTTP 200 但 `"info": 0`（应为 VPS 详情对象），耗时 0.889s；同账号另一台 VPS（id 7094 / vpsid 662 / 节点 DC0605）同一接口返回完整 `info` 对象，耗时 0.542s。两者 `uid` 均为 0、`user_type` 均为 null，故**认证层无差异，认证问题已排除**。字段集合差异（异常那台多出 `pubkey`/`enable_kyc`/`vpc_attachments`/`custom_cp` 等）显示两台由不同版本的 Virtualizor 主控服务。VPS 385 本身运行正常（可 SSH、业务正常），故问题在承载它的 DC5 主控侧。前端崩溃点已定位：`map_address` 位于 `info.flags` 下，`info=0` 时 `info.flags` 为 undefined，`vpsmanage_onload` 抛 TypeError 中断整个面板渲染。已备工单文本，服务商 WAF 会拦含 HTML 标签与完整 URL 的正文，需用纯文本版本提交。
+
+**机器 B 不重装也能装 3x-ui**：release 是 Bootlin musl 全静态链接（`release.yml` 的 `-linkmode external -extldflags '-static'`），不依赖 glibc 版本；捆绑的 xray 也是静态 Go 二进制。唯一障碍是 `install_base` 的 `apt-get update`——Debian 9 源已归档，需先把 `sources.list` 指向 `archive.debian.org` 并加 `-o Acquire::Check-Valid-Until=false`。所以重装是"应该做"而非"必须先做"。
 
 **机器 A 的 REALITY `privateKey` 基准哈希：`2a876c1641027973`**（sha256 前 16 位）。迁移到面板后必须复核这个值不变——这是"客户端配置无需更改"的唯一判据。
 
@@ -172,7 +180,7 @@
 
 **其余已识别的坑**：`install.sh` 的下载 URL 四处硬编码上游 `MHSanaei/3x-ui`，直接运行装的是上游而非本 fork（**尚未决定装哪个**）；重装后防火墙全新，Rocky 9 的 firewalld 默认 enforcing 会让「恢复成功」的服务仍被黑洞，须从机器外验证；`x-ui.sh` 的防火墙菜单硬编码 2053/2096 而非实际随机端口，且 `ufw allow ssh` 只开 22；fail2ban 为 opt-out，其 SSH 端口探测只读 `/etc/ssh/sshd_config` 不读 `sshd_config.d/`；切换收尾必须 `disable --now` 而非 `stop`，否则两个 unit 都 enabled，下次重启抢端口；删除节点的直觉顺序（先删 inbound）会把子节点上的用户一起删掉，正确顺序是先 `SetEnable(false)`；节点 tag 冲突时 adoption 只告警不报错，reconcile 扫描会在数秒后删掉子节点的入站，可用 `InboundSyncMode: selected` 规避。
 
-## 机器 A 迁移进度（2026-09-15）
+## 机器 A 迁移进度（2026-09-15 起，2026-09-16 更新）
 
 用户已重装系统并按下列顺序推进。**尚未导入入站，用户仍全程由裸 Xray 在 443 上服务，pid 1337 自始至终未变。**
 
@@ -185,7 +193,15 @@
 5. **订阅服务器已关闭**（`subEnable=false`），`*:2096` 不再监听。
 6. **公网唯一暴露端口现在只有 443**（裸 Xray），其余全在回环。
 
-未完成：**入站尚未导入**（Step 4 生成 payload 还没开始）。后续步骤为：生成 payload → `POST /panel/api/inbounds/add` 到临时端口 44300 → 测试客户端验证 → 复核 privateKey 哈希与 `clients=1` → `systemctl disable --now xray` → 面板入站端口改 443 → 真实客户端验证。
+7. **入站已导入并验证（2026-09-16）**。走 `POST /panel/api/inbounds/add` 建在临时端口 **44300**，tag `in-vm44212-443`。**没有使用面板 UI**——UI 的 security 下拉框会异步重生成 REALITY 密钥对。用 v2rayN + Xray 26.3.27 实测通过，服务端计数器 `user>>>user1>>>traffic` 记到 **up=618,265 / down=3,607,453**（约 4 MB 真实代理流量）。
+
+   这一组数字一次性证明了整条链路：REALITY 握手成功（`privateKey`/`shortIds`/`serverNames` 全对）、VLESS 认证成功（UUID 对）、`flow=xtls-rprx-vision` 被接受、**`enable:true` 生效**（否则客户端会被静默丢弃、计数器恒为 0）。计数器只统计通过 VLESS 认证并被实际代理的流量——被 REALITY 判为探测而转发给 `dest` 的连接不计入，所以它比"能上网"可靠。
+
+**未完成且已决定延后：切换到 443。** 原因见下节「客户端兼容性硬约束」。当前状态安全且可逆——面板已装好、入站已验证、裸 Xray 照常在 443 服务用户，两者并存互不干扰。
+
+切换的剩余步骤（待约束解除后执行）：`systemctl disable --now xray`（必须是 `disable --now`，只 `stop` 会让两个 unit 都保持 enabled、下次重启抢端口）→ `POST /panel/api/inbounds/update/<id>` 把端口改 443 → 复核 privateKey 哈希 → 真实客户端验证。回滚是反序：先把面板入站挪回 44300 让出端口，再 `systemctl enable --now xray`。
+
+**磁盘上的 `/usr/local/x-ui/bin/config.json` 会滞后，这是正常的。** 面板走热更新路径（`tryHotApply`），通过 Xray gRPC API 直接改运行中的核心，而 `Process.SetConfig`（`internal/xray/process.go:313-317`）只更新内存、不写磁盘；磁盘配置只在真正重启时（`process.go:599`）重写。反过来说：**滞后的 mtime 本身就是热更新成功的证据**——若热更新失败会回落到 `process.Stop()` + 重启，那时磁盘配置会被刷新。权威状态是「数据库 + 实际监听端口 + 计数器」，不是那个文件。
 
 转换脚本见 [`superpowers/tools/make-inbound-payload.py`](superpowers/tools/make-inbound-payload.py)：在节点上读 `config.json`、生成 `/panel/api/inbounds/add` 所需的 payload（`settings`/`streamSettings`/`sniffing` 需为转义字符串），自动补 `enable:true` 与缺失的 `email`，拒绝使用当前生效端口，并打印脱敏预览（私钥与 UUID 只显示长度和 sha256 前 16 位）。机器 B 迁移时复用同一脚本。
 
@@ -199,7 +215,65 @@
 - **删除 API token 需要 `expectedScope` 参数**（`admin` / `monitor` / `node-sync`，见 `api_token.go:55-66`），空值会被 `requireExpectedScope` 拒绝。安装创建的 token 名为 `install`、scope 为 `admin`。
 - **`-getApiToken` 重复调用不会吊销安装时那个 token**：已有 token 时它只重建一个名为 CLI fallback 的**另一个** token（`main.go:511-525`）。要作废 `install` 那个必须显式删除，或卸载重装。
 - **面板密码受 bcrypt 72 字节硬限制**（`golang.org/x/crypto@v0.55.0/bcrypt.go:96` 返回 `ErrPasswordTooLong`，不是截断）。用户名/密码除非空外无任何校验。
+- **面板默认关闭 Xray 的访问日志**：模板（`internal/web/service/config.json`）里是 `"log": {"access": "none", "error": "", "loglevel": "warning"}`，而 `policy` 里 `statsUserUplink`/`statsUserDownlink` 为 true。所以**诊断"某个客户端到底连上了没有"要靠 per-user 计数器，不能靠访问日志**——日志里一条连接记录都不会有。查法：`/usr/local/x-ui/bin/xray-linux-amd64 api statsquery --server=127.0.0.1:62789 -pattern "<email>"`。计数器只统计通过 VLESS 认证并被代理的流量，被 REALITY 判为探测而转发给 `dest` 的连接不计入，因此它比访问日志更能区分"连上了"和"认证并代理成功了"。面板自身日志在 `/var/log/x-ui/3xui.log`（含以 `XRAY:` 前缀转发的核心 warning 及以上级别输出）。
+- **面板模板里只有一个入站**：`dokodemo-door` 的 api 入站在 `127.0.0.1:62789`，另有 Prometheus 指标在 `127.0.0.1:11111`（无鉴权，但仅回环）。两者都不与业务端口冲突，所以装 3x-ui 不会碰 443。
 - **客户端 `email` 必须标识人而不是机器**。共享额度按 email 跨节点聚合（S0 的 `TestTwoNodesShareEmail_SumsCorrectly` 即此语义）。若按节点命名，同一个人在两台机器上会变成两个独立账户、各享一份额度——正是本文件禁止的。机器 A 现有客户端没有 email 字段，导入时必须补，取值需在此刻定好。
+
+## 客户端兼容性硬约束：REALITY `minClientVer`（2026-09-16）
+
+这是目前**阻塞切换**的唯一原因，而且它直接关系到第一版能否满足已确认需求。
+
+### 机制（已确认）
+
+`infra/conf/transport_security.go:103-119`：配置里**没有** `minClientVer` 字段时，核心套用硬编码默认值 `[]byte{26, 3, 27}`，并打印 `The default minimal client version is Xray-core v26.3.27, other clients may be refused to connect`。显式设置该字段会改打另一条警告：`Changing "minClientVer" will increase the likelihood of your server's IP being blocked by the GFW`。
+
+机器 A 上两个 Xray 的版本差解释了一切：
+
+| | 版本 | build | 有门槛？ |
+| --- | --- | --- | --- |
+| 裸 Xray（443，服务用户中） | **26.2.6** | `12ee51e` / go1.25.7 | ❌ 早于该默认值引入 |
+| 面板 Xray（44300） | **26.7.28** | `5ca6f4b` / go1.26.5 | ✅ 门槛 26.3.27 |
+
+门槛随 `Update github.com/xtls/reality to 20260322125925` 在 **v26.3.27** 进入（发布说明正文未提，`transport_security.go:118` 的注释指向 commit `af7eb680`）。v26.2.6 → v26.7.28 之间 13 个发布里只有 v26.3.27 有实质说明，其余都是小补丁。
+
+### 实测结果
+
+| 客户端 | 内核 | 443（26.2.6） | 44300（26.7.28） |
+| --- | --- | --- | --- |
+| 旧版 v2rayN | Xray（旧） | ✅ | ❌ |
+| v2rayN 7.24.9 + Xray 26.3.27 | Xray | ✅ | ✅ |
+| **Shadowrocket（iOS）** | **自研** | ✅ | ❌ |
+
+Shadowrocket 那一行是同一条配置、同一个客户端、**只改端口**的 A/B，所以配置错误已被排除，唯一变量是服务端版本。
+
+**尚未确认的是机制归属**：A/B 只证明 26.2.6→26.7.28 之间某个改动挡住了它，`minClientVer` 是最可能的候选（字面上就是版本门槛，数字也对得上），但该区间还有 `REALITY config: Fix client's shortId length check`（PR #5738）、`maxUselessRecords` 自动探测等其他改动。**确认办法即修法**：给 44300 入站显式设一个极低的 `minClientVer`（如 `0.0.0`）后重测 Shadowrocket——通了则机制确认并同时解决，不通则是区间内别的改动，需继续查。此测试尚未执行。
+
+### 为什么这不只是"某个客户端的问题"
+
+Xray-core README 的分类是权威依据：`## GUI Clients` 列的是基于 Xray-core 构建的客户端，`## Others that support VLESS, XTLS, REALITY, XUDP, PLUX...` 列的是自行实现这些协议的软件。
+
+| 本文件要求兼容的四个客户端 | README 分类 | 内核 |
+| --- | --- | --- |
+| v2rayN | GUI Clients | Xray-core |
+| v2rayNG | GUI Clients | Xray-core |
+| **Shadowrocket** | Others that support… | **自研** |
+| **Clash / mihomo** | Others → Cores | **自研** |
+
+**四个里有两个不是 Xray-core**，而 README 把 `mihomo` 和 `sing-box` 放在同一个 `Cores` 子项下——所以 Shadowrocket 的失败对 Clash/mihomo 有很强的指示性。
+
+### 后果
+
+若机制确认为 `minClientVer`，则它**从"可选的兼容性妥协"变成第一版的必须前置条件**：不降低门槛，Shadowrocket 与 Clash 用户无法使用面板管理的入站，直接违反本文件「第一版仍需兼容 v2rayN、v2rayNG、Shadowrocket、Clash」这条已确认需求。
+
+而降低门槛的代价是核心明确警告 GFW 识别风险上升。机器 A 届时会同时背三条 REALITY 风险警告中的两条（「偷苹果」+「降门槛」；「非 443 端口」会在切换后消失）。因此**换 dest 离开 `www.apple.com` 的优先级会随之上升**。
+
+### REALITY dest 选择标准（来自 REALITY README，供换 dest 时参考）
+
+必要条件：国外网站、支持 TLSv1.3 与 H2、域名非跳转用（通常要用 `www.` 而非裸域）。
+加分项：IP 与代理服务器相近（更像且延迟低）、Server Hello 后握手消息一起加密、OCSP Stapling。
+要避开：国内站、主域名跳转的、以及**被大规模滥用的目标**——`apple`/`icloud` 正是 XTLS 点名的那一类，警告就是为它加的。
+
+注意换 dest 会连带改 `serverNames`，而 `serverNames` 就是客户端的 `sni`——**所有客户端配置都要更新**。应作为一次独立的、计划好的变更，不要和迁移混在一起。
 
 ## 下一阶段顺序
 
@@ -211,3 +285,23 @@
 5. 以两台代理服务器、20 个账号、20 人同时使用为规模验收目标，记录实际客户端、连接负载、流量及延迟证据；不能用 20 个空闲 TCP 连接代替并发使用验收。
 
 新任务首轮的只读接续验收已完成。后续按当前用户指令推进；不要因历史消息中出现过 commit/push、其他项目或安装步骤，就自动执行那些已过时的请求。
+
+### 2026-09-16 的待办队列（按是否被阻塞分类）
+
+**未被阻塞、可立即推进：**
+
+- **确认 `minClientVer` 是否即 Shadowrocket 被拒的机制**：给 44300 入站显式设 `minClientVer: "0.0.0"` 后重测。通了则机制确认并同时解决；不通则是 26.2.6→26.7.28 区间内别的改动（候选：PR #5738 的 shortId 长度检查、`maxUselessRecords` 自动探测）。**这是解除切换阻塞的关键一步。**
+- **评估并移植三个上游安全补丁**（纯本机工作，不需要服务器）：`a31fa9abfa`（节点跨入站污染客户端凭据，GHSA-rr44-v4rv-x654——注册机器 B 为节点正是触发该问题的配置，所以这条最紧急）、`23511108bf`（数据目录 0700 / DB 0600，带测试）、`f294e1806d`（安装更新校验 SHA256 sidecar）。这是 S2 的前置条件。
+- 机器 B 装 3x-ui（改 apt 源即可，不必等重装）。
+
+**被阻塞：**
+
+- 机器 A 切换到 443 → 阻塞于 `minClientVer`。
+- 机器 B 重装系统 → 阻塞于服务商面板故障（工单待提交）。
+- S1 实验 3（节点失联收敛）→ 阻塞于第二个节点尚未就绪。
+- S3 共享额度实现 → 阻塞于连接控制方向未定。
+
+**已知但优先级待定：**
+
+- 换 dest 离开 `www.apple.com`（XTLS 点名的高风险目标）。若 `minClientVer` 必须降低，此项优先级上升，因为届时会同时背两条 REALITY 风险警告。注意换 dest 连带改 `serverNames` = 所有客户端的 `sni`，必须作为独立变更计划。
+- 机器 A 的 `xray.service` 仍是 `User=root` 且降权三行被注释（恢复自备份）。机器 B 那台是 `nobody` + `AmbientCapabilities`，可直接照抄。
