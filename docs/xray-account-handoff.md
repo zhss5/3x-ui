@@ -162,6 +162,8 @@
 
 **本仓库钉的 Xray 版本不等于机器 A 上那个。** 二进制版本钉在三处并同步：`DockerInit.sh:35`、`.github/workflows/release.yml:127` 与 `:290`。`v3.7.0`（机器 A 安装的版本，2026-08-24）钉 **v26.7.28**；当前 `main` 自 `d0edbcec`（2026-09-09）起钉 **v26.9.9**。Go 模块 `github.com/xtls/xray-core` 只提供 config 结构体与 gRPC stats/handler/router API，不是运行时核心：v3.7.0 为 `...-5ca6f4b7d4dc`（即 26.7.28），main 为 `...-52a412d9e2f5`；间接依赖 `github.com/xtls/reality` 在 v3.7.0 是 `20260322125925`、main 是 `20260908062103`。**所以升级面板会把核心从 26.7.28 推到 26.9.9，跨过上游撤回 `minClientVer` 默认值并换上 MLKEM768 闸的那道分界线。** 面板另有独立于面板版本的 Xray 二进制切换器（`POST /server/installXray/:version`，下限 v26.6.27），但其选择不持久，下次 `x-ui update` 会被覆盖。
 
+**分支陷阱（已经害人一次）**：本文件所在的 `codex/xray-account` 分支是从 `v3.7.0` 分出的，所以它的工作树里 `DockerInit.sh:35` 仍是 v26.7.28、`go.mod` 的 `reality` 仍是 `20260322125925`——**与 `main` 不同**。在本分支上 grep 出来的版本号不代表 `main` 会发布什么，反之亦然。判断「门槛在不在」时必须先说清问的是哪个分支、哪个发布、还是机器 A 上那个运行中的二进制，这三者当前互不相同。
+
 **机器 B 目前无法重装系统**：服务商（hmbcloud）的 WHMCS 面板 VPS 管理区空白。已定位到具体原因——`clientarea.php?action=productdetails&id=5973&api=json&act=vpsmanage` 返回 HTTP 200 但 `"info": 0`（应为 VPS 详情对象），耗时 0.889s；同账号另一台 VPS（id 7094 / vpsid 662 / 节点 DC0605）同一接口返回完整 `info` 对象，耗时 0.542s。两者 `uid` 均为 0、`user_type` 均为 null，故**认证层无差异，认证问题已排除**。字段集合差异（异常那台多出 `pubkey`/`enable_kyc`/`vpc_attachments`/`custom_cp` 等）显示两台由不同版本的 Virtualizor 主控服务。VPS 385 本身运行正常（可 SSH、业务正常），故问题在承载它的 DC5 主控侧。前端崩溃点已定位：`map_address` 位于 `info.flags` 下，`info=0` 时 `info.flags` 为 undefined，`vpsmanage_onload` 抛 TypeError 中断整个面板渲染。已备工单文本，服务商 WAF 会拦含 HTML 标签与完整 URL 的正文，需用纯文本版本提交。
 
 **机器 B 不重装也能装 3x-ui**：release 是 Bootlin musl 全静态链接（`release.yml` 的 `-linkmode external -extldflags '-static'`），不依赖 glibc 版本；捆绑的 xray 也是静态 Go 二进制。唯一障碍是 `install_base` 的 `apt-get update`——Debian 9 源已归档，需先把 `sources.list` 指向 `archive.debian.org` 并加 `-o Acquire::Check-Valid-Until=false`。所以重装是"应该做"而非"必须先做"。
@@ -257,6 +259,20 @@
 
 最强的佐证是上游自己的动作：RPRX 在 2026-09-08 教服务端**直接检查真实属性**（要 X25519MLKEM768），并在同一个提交里把版本号默认值注释掉。结构性检查取代了版本号这个代理——等于作者承认版本号只是代理。
 
+### 维护者自己的说法（一手，非社区转述）
+
+- `af7eb680` 的提交正文引用 Xray-core PR #6181 的评论（RPRX，2026-05-28）与两条 Telegram 帖子。该评论点名 X25519MLKEM768：mihomo 钉住不带后量子的 Chrome 120 仿冒指纹、sing-box 从当代 Chrome 指纹里把 X25519MLKEM768 剔掉，两者都**造成强特征**；他同时说这目前之所以没被惩罚，只是因为用户基数小。
+- t.me/projectXtls/3378 给出最直接的一句：内置版本号**应当与 TLS 指纹更新同步，否则 Xray 就得在 REALITY 服务端维护 JA4 指纹白名单**。也就是说，`minClientVer` 就是「服务端 JA4 白名单」的替代品——版本号只是指纹的代理，作者自己这么讲。
+- t.me/projectXtls/3373 写明默认限制客户端最小版本「同时阻止了有问题的客户端 TLS 指纹」，并**明说愿意放弃兼容另外两个内核**。这一条对本项目是决策级信息：mihomo / sing-box 连不上不是副作用，是上游有意为之，所以不要指望上游或第三方内核会来解决。
+
+### 因果链上被跳过的一步（重要限定）
+
+「旧指纹 → 服务器 IP 被封」这条链里，服务端的拒绝发生在**完整 ClientHello 已经穿过防火墙之后**。审查者要看的那几十个字节此时已在线上、已可归因到该目的 IP。所以这道门**并不能阻止坏指纹被观测到**，它只能削减握手之后的流量、时长与连接数特征。
+
+它真正起作用的方式是**生态倒逼**：让旧客户端连不上，逼用户与第三方内核升级，从此不再发出这类 hello。这与上面 3373 的原话一致。把它理解成「服务端拒绝 = 审查者看不见坏指纹」是想当然。
+
+另外，「审查者确实按 ClientHello 指纹（尤其是有无 PQ key share）做封锁决策」这一环**没有任何公开实测支撑**——gfw.report 2022 年那篇只写了「怀疑与 TLS 指纹有关，尚无实测」，之后无闭环。这是整条论证里唯一纯经验且完全空白的一环，不要当已证实。
+
 ### 实测结果（累积）
 
 | 客户端 | 内核 | 自报版本 | 443（裸 26.2.6，无闸） | 44300（面板 26.7.28，门槛 26.3.27） |
@@ -283,7 +299,7 @@ mihomo 在 `component/tls/reality.go:74-76` 硬编码 `1.8.2`（Value=67586，�
 
 | 方案 | 做法 | 代价 / 未知 |
 | --- | --- | --- |
-| **A. 显式设 `minClientVer`** | 给入站设 `"1.0.0"`，停留在 26.7.28 | 一次 API 调用、随库持久、不动二进制。核心会打 GFW 警告，但上游两个月后自己撤回了该默认值，这条警告的权重需重新评估 |
+| **A. 显式设 `minClientVer`** | 给入站设 `"1.0.0"`，停留在 26.7.28 | 一次 API 调用、随库持久、不动二进制。核心会打 GFW 警告（该警告挂在「**任何**显式设置」分支上，不区分调高调低）。但注意两点：上游两个月后自己撤回了该默认值，≥26.9.8 的出厂默认就是无下限；且版本号由客户端自报、可任意填，所以它**不是可强制的安全控制**，把设 `1.0.0` 说成「实质降低安全性」并不准确——真正变化的是不再倒逼旧指纹升级 |
 | **B. 换 Xray 二进制到 26.6.27 ～ 26.7.10** | 面板自带版本切换器 `POST /server/installXray/:version`（`internal/web/controller/server.go:70`，UI 在 `frontend/src/pages/index/VersionModal.tsx`，带 `.dgst` SHA256 校验，下限 v26.6.27） | 该窗口两道闸都没有。但**不持久**——下次 `x-ui update` 会被 release 钉的版本覆盖（`update.sh:1100`） |
 | **C. 要求客户端升级** | — | **对 mihomo 不可行**（见上）。Shadowrocket 在中国区已下架，中国区 Apple ID 无法更新或重新下载，属用户侧不可控前置条件 |
 | **D. 升级面板到 26.9.x** | — | **最差**。换成不可配置的 MLKEM768 闸；本仓库 Clash 订阅不输出 `support-x25519mlkem768`（见下）；已有 SR 2.2.92 在 26.9.9 上失败的公开报告（`Shadowrocket/config#4`、`MHSanaei/3x-ui#6543`） |
