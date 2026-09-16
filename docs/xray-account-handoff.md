@@ -310,7 +310,7 @@ mihomo 在 `component/tls/reality.go:74-76` 硬编码 `1.8.2`（Value=67586，�
 
 ### 仍未确认的（不要当已知）
 
-- **机器 A 面板核心的当前实际版本未在成功那一刻核实**。26.7.28 来自 2026-09-15 的记录，不是运行中二进制的输出。若期间被更新到 ≥26.9.8，默认门槛已不存在，则 Shadowrocket 2.2.92 通过与客户端升级无关，本节大量推论需重做。**这正是本文件禁止的「把旧记录当运行证据」。**
+- ~~机器 A 面板核心的当前实际版本未在成功那一刻核实~~ **已核实（2026-09-16）**：`/usr/local/x-ui/bin/xray-linux-amd64 -version` 输出 `Xray 26.7.28 (Xray, Penetrates Everything.) 5ca6f4b (go1.26.5 linux/amd64)`，与记录逐字相符。26.7.28 落在默认门槛存续窗口 v26.7.11…v26.7.28 之内，**所以那道闸确实活跃**，本节推论的最大前提成立。由此「Shadowrocket 2.2.92 自报的版本三字节 ≥ 26.3.27」从推测变为被代码强制推出的事实——版本比较就在那个合取式里，过了就意味着这一项为真。
 - **Shadowrocket 2.2.92 实际往 `SessionId[0:3]` 写什么字节，从未被源码或抓包证实**。2.2.91 的更新说明里有 `feat(reality): add client version setting`——是个**设置项**，默认值、UI 位置、是否需手填均无公开文档。
 - **这次不是干净的 A/B**。原 A/B 固定客户端变端口，这次固定端口变客户端，两边都缺控制臂；且 2.2.90 同时带入 `support-x25519mlkem768 and consolidate reality options parsing`（REALITY 选项解析重构），升级后 profile 是否被重写未做字段级比对。
 - v2rayNG 与 Clash/mihomo 在 44300 上**从未测过**。以 1/4 客户端的一次成功判定 4/4 就绪，样本不支撑。
@@ -327,10 +327,10 @@ mihomo 在 `component/tls/reality.go:74-76` 硬编码 `1.8.2`（Value=67586，�
 
 在 **44300** 上做，不碰 443，因此非破坏性：
 
-1. **核实运行中的核心版本**：`/usr/local/x-ui/bin/xray-linux-amd64 -version`，同时记 x-ui 版本与进程启动时间。这一步不可跳——本节全部推论都挂在「面板核心仍是 26.7.28」上，而该版本号来自 2026-09-15 的记录，不是运行时输出。若结果 ≥26.9.8，默认门槛早已不存在，Shadowrocket 2.2.92 能连与客户端升级无关，本节需重做。
-2. **开判定日志**：给该入站的 `realitySettings` 设 `"show": true`（面板已暴露该字段，`frontend/src/pages/inbounds/form/security/reality.tsx:83-84`）。面板默认关闭 Xray 访问日志，不开这个就没有任何服务端侧的失败观测——此前只能靠猜，正是因为这个。
-3. **测 v2rayNG（最新版）连 44300**，并复测 Shadowrocket 2.2.92。两者都通过则 26.7.28 的默认门槛对收窄后的清单**不构成障碍，无需任何配置改动即可切换**——这也是最安全的结果：保留反指纹卫生、不打 GFW 警告、不必钉二进制版本。记录 v2rayNG 的实际版本号及其打包的 Xray 核心版本，后者才是决定它过不过闸的量。
-4. **仅当 v2rayNG 失败时**才需要做 `minClientVer` 的 A/B：显式设 `"99.99.99"` 确认机制归属，再设 `"1.0.0"` 验证方案 A。
+1. ~~核实运行中的核心版本~~ **已完成（2026-09-16）**：实测 `Xray 26.7.28 / 5ca6f4b / go1.26.5`，门槛活跃，前提成立。
+2. **直接测 v2rayNG（最新版）连 44300**，并复测 Shadowrocket 2.2.92。**先测，不要先开日志**——两者若都通过，收窄后的清单即全过，26.7.28 的默认配置**无需任何改动即可切 443**，这也是最安全的落点：保留反指纹卫生、不打 GFW 警告、不必钉二进制版本。记录 v2rayNG 的版本号**及其打包的 Xray 核心版本**，后者才是决定它过不过闸的量（v2rayN 的 `tcp`→`raw` 显示名变化就是核心换代的可见标志）。
+3. **仅当 v2rayNG 失败**，才开 `realitySettings.show = true` 查原因（字段见 `frontend/src/pages/inbounds/form/security/reality.tsx:83-84`）。服务端在门槛判定**之前**打印 `ClientVer` / `ClientTime` / `ClientShortId`，判定结果见 `hs.c.conn == conn`；日志落在 `/var/log/x-ui/3xui.log`（文件后端恒为 DEBUG，无需改 `XUI_LOG_LEVEL`，但 `journalctl` 看不到）。**代价**：show 明文打印 shortId 与每个客户端 IP，且其输出会顶掉面板 UI 上显示的 Xray 状态（`LogWriter.setLastLine` → `process.GetResult`）。查完即关。
+4. 若确认是版本门槛，再做 `minClientVer` 的 A/B：显式设 `"99.99.99"` 反向验证，再设 `"1.0.0"` 验证方案 A。
 
 改入站走 `POST /panel/api/inbounds/update/<id>`，**整行替换语义**：`privateKey`、`shortIds`、`serverNames`、`dest`、`xver` 以及 settings 里每个 client 的 `email` 必须逐字节原样回传，漏字段会被写成零值，`email` 不一致会丢失流量计数行。每次改完复核 privateKey 的 sha256 前 16 位仍为 `2a876c1641027973`。
 
