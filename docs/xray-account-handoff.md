@@ -541,6 +541,47 @@ v3.7.0 ──92──▶ origin/main ──68──▶ v3.8.0 ──39──▶ 
 
 **根治需要代码改动**（写入时归一化，或给唯一索引加 NOCASE），属于行为变更，须单独立项并与 CLAUDE.md「改动幅度匹配问题幅度」一并权衡，**不要顺手做**。
 
+## 面板「在线/离线」的真实判据（2026-09-17 读码确认）
+
+面板客户端列表那一列的准确含义是:**最近一次 5 秒轮询时，Xray 核心报告该 email 至少有一条活连接，且该状态在 20 秒内未过期。** 它既不实时，也不等于「正在传数据」。
+
+**链路与两个决定性常数**：
+
+| 环节 | 值 | 出处 |
+| --- | --- | --- |
+| 轮询周期 | **5 秒** | `web.go:293` `cadenceXrayTraffic` |
+| 老化窗口 | **20 秒** | `inbound_node.go:204` `onlineGracePeriodMs` |
+
+写入链：`xray_traffic_job.go:149` → `inbound_node.go:1521-1525` → `process.RefreshLocalOnline(..., 20000)` → `process.go:463-497`，每轮给有活连接的 email 打时间戳，再从 `now - ts < graceMs` 的条目重建列表（半开区间，恰好 `graceMs` 会被老化掉）。
+
+那 20 秒宽限是**故意设成轮询的 4 倍**（`inbound_node.go:199-203` 的注释写明理由）：核心对一个活跃会话在单次轮询间可能报零增量，宽限设成 5 秒会把正在用的人误判成离线。
+
+**最坏陈旧程度**：单机约 **25 秒**（20 秒宽限 + 最多 5 秒到下一轮）；多节点一跳约 34 秒；每多一跳再加约 9 秒。
+
+### 三个会静默骗人的地方
+
+1. **HTTP 请求不发 gRPC。** `POST /clients/onlines` → `process.GetOnlineClients()` 只是加读锁读那个内存切片，**没有任何新鲜度检查**。写端（cron）一旦停摆，读端就一直返回旧数据，不报错、无标记——**本地 Xray 停止或节点 flap 成 offline 时，陈旧程度无上界**。
+2. **浏览器不轮询。** `useClients.ts:235-243` 的 onlines 查询是 `staleTime: Infinity` 且**无 `refetchInterval`**（同文件 `:217` 那个 5 秒轮询属于客户端列表分页，不是在线列表），只靠 WebSocket 推送 `setQueryData`（`:715`）更新。**WS 断了列表会冻住，页面上没有任何提示。**
+3. **核心给的精确时间戳被丢掉了。** `OnlineIP.LastSeen` 是核心最后一次为该源 IP 分发链接的 unix 秒，是整条链路里唯一真正新鲜的数据；但在线列表路径只取 `u.Email`、**把 `u.IPs` 整个丢弃**（`xray_traffic_job.go:125-131`）。它只在 IP 限制那条路上活下来。所以面板展示的粒度比核心给的数据粗。
+
+### 一条会误导排障的日志
+
+核心不支持 online-stats API 时，`xray.go:1163` 打的是 `falling back to traffic-delta onlines and access-log IP limit`。**但那条 access-log 回落路径已经从代码里删掉了**——`check_client_ip_job.go:60-65` 是 `if !apiMode { ...; return }`，注释明写「There is no access-log fallback anymore, so there is nothing to do this run」。该日志承诺了一个不存在的机制，会误导任何照它排查的人。
+
+实际上这条分支在现代核心上近乎不可达：`ensureStatsPolicy`（`xray.go:986-1018`）在生成运行配置时**强制向每个 policy level 注入 `statsUserOnline: true`**，即便模板里没有（出厂模板确实没有）。注意 `:988-990` 的守卫会放过一个完全为空的 policy 块。
+
+### 运维结论
+
+**不要用在线列表判断任何变更是否成功。** 切换端口、改客户端之后，真实用户重连可能要 20-25 秒才显示；反过来老连接断了列表还会挂 20 秒。两个方向都会误导。
+
+**要判断用计数器**，它即时且确定：
+
+```bash
+/usr/local/x-ui/bin/xray-linux-amd64 api statsquery --server=127.0.0.1:62789 -pattern "<email>"
+```
+
+同理，`Online` ≠ 正在传数据（挂着不用也算），`Offline` ≠ 不可用（只是此刻没连着）。
+
 ## 热更可靠性：实测结论（2026-09-17）
 
 此前「改客户端会不会断线」只有读码推论（见「随之确认的操作性事实」里的 30 秒自动重启窗口）。当日取到了实测证据。
