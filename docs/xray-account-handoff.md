@@ -411,12 +411,44 @@ mihomo 在 `component/tls/reality.go:74-76` 硬编码 `1.8.2`（Value=67586，�
 - **端口冲突检测只查数据库，不探测操作系统。** `checkPortConflictTx`（`port_conflict.go:171`）只查 `inbounds` 表加两个合成保留项（Xray API 入站、AmneziaWG SOCKS 中继）。**被非面板进程占用的端口（裸 xray、nginx）检测不到**，行照常保存，随后 Xray 启动失败——直接触发上一条的死循环。
 - **入站与节点是一对多，`client_inbounds` 是多对多关联表。** `Inbound.NodeID *int` 为 nil 表示面板本机的入站；`inbounds.id` 是面板库的全局自增主键，跨节点统一编号，不是「每个节点从 1 开始」。一个人（`clients` 表一行、一份额度）通过 `client_inbounds` 挂到多个节点的入站上——这就是共享额度在数据层的实现基础。`Inbound.Tag` 是 `gorm:"unique"`，**跨节点也不能重名**。
 
-### 机器 A 当前客户端
+### 机器 A 当前客户端（2026-09-17 更新）
 
-| email | flow | 说明 |
-| --- | --- | --- |
-| `user1` | `xtls-rprx-vision` | 从裸 Xray 配置导入，服务真实用户 |
-| `zlz2026` | `xtls-rprx-vision` | 2026-09-17 新增，热更生效，未重启核心 |
+| email | flow | subId | 说明 |
+| --- | --- | --- | --- |
+| `user1` | `xtls-rprx-vision` | 2026-09-17 补齐 | 从裸 Xray 配置导入，服务真实用户；曾无 subId，见下 |
+| `zlz2026` | `xtls-rprx-vision` | 有（UUID，36 字符） | 2026-09-17 新增，热更生效，未重启核心 |
+| `chenxiang` | `xtls-rprx-vision` | 有（UUID，36 字符） | 2026-09-17 新增；原名 `ChenXiang`，当日改为全小写，见下 |
+
+### 导入的客户端没有 subId，`make-inbound-payload.py` 也不生成（2026-09-17）
+
+`user1` 自导入之日起就没有 subId，因此面板对它**既给不出二维码也给不出分享链接** —— `ClientQrModal.tsx:229` 完全以 `client?.subId` 为闸，空则直接显示 "This client has no subId, no shareable link"。订阅同理。这**又一次卡住第一版目标第 1 条**。
+
+根因与 09-17 早些时候那次 `realitySettings.settings` sidecar 缺失**是同一类**：入站与客户端都是从裸 Xray 配置导入的，而裸配置里不存在任何面板专用元数据。`docs/superpowers/tools/make-inbound-payload.py` 全文没有 `subId` 字样。走 `POST /panel/api/clients/add` 新建的客户端则不会有这个问题——`client_crud.go:203` → `fillProtocolDefaults` 在 subId 留空时自动生成。
+
+**修法是零风险的**：`ClientService.Update`（`client_crud.go:450`）有 `if updated.SubID == "" { updated.SubID = uuid.NewString() }`，所以在面板里打开该客户端、什么都不改直接保存即可。**对核心零影响**——配置生成器从头重建 clients 数组（`xray.go:212` `entry := map[string]any{"email": c.Email}`，VLESS 分支只再放 `id`/`flow`/`reverse`），**subId 永远不进 Xray 配置**，因此生成的配置逐字节不变、`RestartXray(false)` 在 `configUnchanged` 处直接返回。
+
+**机器 B 迁移前必须先给脚本补上 subId 生成**，否则原样重蹈。这是继 sidecar 之后同一个脚本的第二个同类缺口。
+
+### 客户端改名实测：`ChenXiang` → `chenxiang`（2026-09-17）
+
+该客户端建立时用了混合大小写的真实姓名，违反当日刚定下的「全小写不透明 handle」约定（见上文 `BulkCreate` 那条）。当日改名并对全链路取证。
+
+**改名前的只读体检**（缺一不可）：入站 settings 的 email 集合与 `clients` 表逐项比对确认无孤儿（`compactOrphans` 会在写客户端前静默剔除入站里没有对应 `clients` 行的条目）。实测两个集合相等。
+
+**代码路径（读码确认，非推断）**：
+1. 冲突检查 `Where("email = ? AND id <> ?", updated.Email, id)`（`client_crud.go:475-485`）是**字节精确**的，因此不存在的 `chenxiang` 不会被自己挡住。
+2. `strings.EqualFold(oldEmail, clients[0].Email)`（`client_inbound_apply.go:890`）对纯大小写变更返回 **true**，于是走 `emailUnchanged` 分支，**不走「删旧建新」**。
+3. `UpdateClientStat`（`inbound_traffic.go:569`）以旧 email 定位行、把新 email 写进该行；`up`/`down` **不在 Updates map 内**，因此流量原样保留。
+4. `UpdateClientIPs(tx, oldEmail, newEmail)` 同步迁移 IP 记录。
+5. 以上连同 `tx.Save(oldInbound)` 全在同一个 `runSerializedTx` 内——**settings JSON、`clients`、`client_traffics` 三处原子更新**。
+
+**实测结果**：`client_traffics` 改名后只有三行、**无 `ChenXiang` 残行**（身份未劈裂）；`chenxiang` 的 `up`/`down` 为 0，与改名前一致——该客户端从未连接过，不是改名丢失。`clients` 表三行齐全、subId 保留。
+
+**用户侧零影响**：VLESS 靠 UUID 认证，email 只是计数标签，客户端配置里根本没有它。
+
+**已知的残留**：Xray 核心里 `user>>>ChenXiang>>>traffic` 计数器不会消失（核心从不删计数器），但面板已无对应行，对它的更新命中 0 行后静默丢弃。影响仅为改名瞬间可能丢几秒增量，核心重启后自然消失。
+
+**这次改名安全的前提是三处拼写原本一致**。若已有漂移则不然：`client_inbound_apply.go:666-667` 会把 `oldEmail` 覆盖成 settings JSON 的拼写，而 `:949-956` 的 `clients` 改名与 `UpdateClientStat` 均以它为键且**都不检查 `RowsAffected`**——改名会 0 行匹配却返回成功，同时为新名插一行，**把一个身份劈成两个**。多入站客户端还有第二重风险：`client_crud.go:499-542` 按入站循环、遇错即返回，**没有跨入站事务**。`chenxiang` 只挂一个入站，故本次不适用。
 
 ## 升级到 v3.8.x 的实测代价（2026-09-17）
 
