@@ -12,7 +12,7 @@
 
 2026-09-16 **切换已完成**：机器 A 的 443 已由面板管理的 Xray 26.7.28 接管，裸 Xray 26.2.6 已 `systemctl disable --now`。实测证据：`ss -ltunp` 显示同一进程（pid 26861）同时监听 `*:443`、`127.0.0.1:62789`（api 入站）与 `127.0.0.1:11111`（metrics），裸 Xray 进程已消失。用户确认迁移成功。**机器 A 自此完全由面板管理**，后续一切入站/客户端变更都必须经面板而非 `/usr/local/etc/xray/config.json`。详见「机器 A 迁移进度」第 8 条，其中列出了尚未记录的复核项。
 
-2026-09-17 状态更新：机器 A 新增第二个客户端 `zlz2026`，经 `rt.AddUser` 热更生效、核心未重启、现有用户未受影响。过程中对着源码核实出四条此前未知的约束（`compactOrphans` 静默剔除、30 秒自动重启窗口、`realitySettings.settings` sidecar 缺失导致链接/订阅不可用、`BulkCreate` 大小写使共享额度分裂），见下文「客户端管理的已验证事实（2026-09-17）」。其中第三条**卡住第一版目标第 1 条**，已进入待办队列。
+2026-09-17 状态更新：机器 A 新增第二个客户端 `zlz2026`，经 `rt.AddUser` 热更生效、核心未重启、现有用户未受影响。过程中对着源码核实出四条此前未知的约束（`compactOrphans` 静默剔除、30 秒自动重启窗口、`realitySettings.settings` sidecar 缺失导致链接/订阅不可用、`BulkCreate` 大小写使共享额度分裂），见下文「客户端管理的已验证事实（2026-09-17）」。其中第三条**曾卡住第一版目标第 1 条**，**当日已修复**——sidecar 已补齐、链接带上 `pbk`/`fp`、核心零影响，`make-inbound-payload.py` 亦已补上生成逻辑，机器 B 不会重蹈。
 
 2026-09-16 当日三次更新（切换已解除阻塞，历史）：收窄后的必测清单 **v2rayN / Shadowrocket 2.2.92 / v2rayNG 全部通过 44300**，且是在核心版本经实测确认为 26.7.28、默认门槛活跃的前提下通过的。**机器 A 切换到 443 不再被客户端兼容性阻塞，且不需要任何配置改动。** 剩余风险与切换步骤见「客户端兼容性硬约束 → 验收结果」与「机器 A 迁移进度」。
 
@@ -389,6 +389,8 @@ mihomo 在 `component/tls/reality.go:74-76` 硬编码 `1.8.2`（Value=67586，�
 
 3. **机器 A 的入站缺 `realitySettings.settings` sidecar，分享链接与订阅整体不可用。** 实测该入站的 `realitySettings` 只有 `['dest','privateKey','serverNames','shortIds']`——裸 Xray 服务端配置本来就不含公钥。而 `applyShareRealityParams`（`internal/sub/service.go:1617-1640`）的 `pbk` 与 `fp` 取自 `realitySettings.settings.{publicKey,fingerprint}` 这个**面板专用子块**，全仓库没有任何 Go 代码从 privateKey 反推 REALITY 公钥（只有 WireGuard 有 `PublicKeyFromPrivate`）。所以面板生成的链接缺 `pbk`/`fp`，客户端无法握手。**这直接卡住第一版目标第 1 条（用户自助获取配置）**，`make-inbound-payload.py` 当初未生成该块。当前绕法：取一条已能用的客户端链接，只替换 UUID——`pbk`/`sid`/`sni`/`flow` 全是入站级的，所有客户端相同。
 
+   **2026-09-17 已修复。** 走 `GET /inbounds/get/1` → 注入 sidecar → `POST /inbounds/update/1` 的读改写流程补齐（`publicKey` 取自已在工作的客户端配置，未触碰 privateKey）。实测链接已带 `pbk` 与 `fp`，pid 未变、`enable`/`port`/两个客户端均完好。**这次改动对核心零影响**：`xray.go:296-305` 在生成配置前 `delete(realitySettings, "settings")`，所以生成的 Xray 配置逐字节不变，`RestartXray(false)` 在 `configUnchanged` 处（`xray.go:1317-1320`）直接返回，连热更都不触发。注意 sidecar 的 `serverName` 留空无害：分享链接的 `sni` 取自外层 `serverNames`（`sub/service.go:1621-1625`），Clash 路径在 `clash_service.go:775-776` 用 `serverNames[0]` 覆盖。
+
 4. **`BulkCreate` 的大小写不一致会让共享额度静默分裂。** `client_bulk.go:1197` 用字节精确的 `db.Where("email IN ?")` 查已有记录，`:1201` 却用 `strings.ToLower(...)` 做 map 的键，`:1212` 的 subId 归属也已小写化——两道闸同时落空。用大小写变体 + 同一个 subId 再加一次，会创建**第二行** `clients` 记录，`created=1` 无警告，**同一个人变成两份额度**，正是共享额度机制要防的失败。子 agent 已实测复现。单客户端 `Create` 路径是封闭的（以 `subId already in use` 拒绝）。**规则：给已有的人挂第二个节点的入站，必须走 `/clients/:email/attach` 或单客户端 Create，禁止用 BulkCreate / CSV 导入。** 这与 email 是否为邮箱格式无关，`User2` vs `user2` 同样触发；据此本次选用全小写不透明 handle `zlz2026`。
 
 ### 随之确认的操作性事实
@@ -400,6 +402,10 @@ mihomo 在 `component/tls/reality.go:74-76` 硬编码 `1.8.2`（Value=67586，�
 - **`success:true` 不是成功判据。** flow 被清空、客户端被 `compactOrphans` 剔除，接口都照常返回成功。每次写操作后必须回读 `GET /panel/api/inbounds/get/<id>` 确认 `flow` 与 `enable`。
 - **客户端 IP 不依赖 Xray 访问日志。** `check_client_ip_job.go:32` 明确写 "no access log is involved"，数据来自核心的 online-stats gRPC API（`GetOnlineUsers`），每 10 秒一轮（`cadenceClientIPScan`）。`limitIp=0` 时仍然记录——`:507-515` 的分支注释为 "collection-only run"。所以面板默认 `access: "none"` 不影响查 IP。查法：`POST /panel/api/clients/ips/<email>`。这修正了此前「关了访问日志就看不到 IP」的推测。
 - **`GET /panel/api/inbounds/list` 返回的 `settings`/`streamSettings` 是 JSON 对象，不是转义字符串**；而 `/add` 两种都收。`model.Inbound` 的自定义 `MarshalJSON`/`UnmarshalJSON`（`model.go:188-217`）用 `json.RawMessage` + `jsonStringFieldFromRaw` 做双向兼容，Go 侧字段本身是 `string`。
+- **更正（2026-09-17 当日）：客户端创建时漏传 `enable`，`clients` 表里是 `true` 而不是 `false`。** `ClientRecord.Enable` 带 `gorm:"default:true"`（`model.go:938`），GORM 在 INSERT 时省略 Go 零值布尔，于是数据库默认值生效；`false` 只留在 `client_traffics.enable` 里。结果比「被停用」更隐蔽：**面板显示该客户端已启用，而 Xray 从不为他服务**。（`make-inbound-payload.py` 里那句 "writes Enable=false into client_traffics" 的注释是准确的。）本条只针对 create 路径，`/clients/update/:email` 的全量替换语义不受影响。
+- **配置载入失败会让整台机器陷入重启死循环。** Xray 是单进程单配置文件，任何一个入站存了核心无法载入的配置，**该核心上所有入站一起挂**。且 `cmd.Start()` 对「启动后随即因配置报错退出」返回 nil，于是 `RestartXray` 报成功、`ApplyPendingRestart` 清掉 need-restart 标志、`CheckXrayRunningJob` 每约 2 秒重启一次死核心，无限循环。机器 B 建入站时这是最大风险。
+- **推给核心的与 30 秒后重新生成的不是同一份配置。** 立即推送的是**原始请求**，而下一次配置重建是从规范化的 clients 表重新拼的，两者会有差异——「刚建完能用、过一会儿失效」这种延迟失效由此而来。因此新建入站后的验收不能只做一次，必须在下一个重建周期之后复验。
+- **端口冲突检测只查数据库，不探测操作系统。** `checkPortConflictTx`（`port_conflict.go:171`）只查 `inbounds` 表加两个合成保留项（Xray API 入站、AmneziaWG SOCKS 中继）。**被非面板进程占用的端口（裸 xray、nginx）检测不到**，行照常保存，随后 Xray 启动失败——直接触发上一条的死循环。
 - **入站与节点是一对多，`client_inbounds` 是多对多关联表。** `Inbound.NodeID *int` 为 nil 表示面板本机的入站；`inbounds.id` 是面板库的全局自增主键，跨节点统一编号，不是「每个节点从 1 开始」。一个人（`clients` 表一行、一份额度）通过 `client_inbounds` 挂到多个节点的入站上——这就是共享额度在数据层的实现基础。`Inbound.Tag` 是 `gorm:"unique"`，**跨节点也不能重名**。
 
 ### 机器 A 当前客户端
@@ -428,8 +434,9 @@ mihomo 在 `component/tls/reality.go:74-76` 硬编码 `1.8.2`（Value=67586，�
 - ~~机器 A 切换到 443~~ **已完成（2026-09-16）**，见「机器 A 迁移进度」第 8 条。`is-enabled=disabled` 与 privateKey 哈希均已于 2026-09-17 复核通过。**仍缺**：v2rayNG 的版本号与其打包的 Xray 核心版本（本文件要求记录实际版本）。
 - **修 Clash 订阅缺 `support-x25519mlkem768`**（纯本机工作）：`internal/sub/clash_service.go:1067-1079` 的 `reality-opts` 只有 `public-key` / `short-id`。面板核心一旦到 ≥26.9.8，mihomo 订阅用户会静默失效。上游 `MHSanaei/3x-ui#6555` / `#6451`。与迁移无关，可独立推进。
 - **评估并移植三个上游安全补丁**（纯本机工作，不需要服务器）：`a31fa9abfa`（节点跨入站污染客户端凭据，GHSA-rr44-v4rv-x654——注册机器 B 为节点正是触发该问题的配置，所以这条最紧急）、`23511108bf`（数据目录 0700 / DB 0600，带测试）、`f294e1806d`（安装更新校验 SHA256 sidecar）。这是 S2 的前置条件。
-- **补齐机器 A 入站的 `realitySettings.settings` sidecar**（2026-09-17 新增，`publicKey` + `fingerprint`）。不补则面板的分享链接与订阅对该入站永久不可用，**第一版目标第 1 条（用户自助获取配置）无法交付**。公钥需从现有 privateKey 推导（`xray x25519`，参数拼法按固定版本核实）或从任一可用客户端配置的 `pbk` 取得；privateKey 本身不得变更，否则全部存量客户端失效。改的是活跃入站，须走 `POST /panel/api/inbounds/update/<id>` 并按上节的 30 秒重启窗口验证 pid。
-- **给 `make-inbound-payload.py` 补生成 `realitySettings.settings`**，避免机器 B 迁移时重蹈机器 A 的覆辙。
+- ~~补齐机器 A 入站的 `realitySettings.settings` sidecar~~ **2026-09-17 已完成**，见「客户端管理的已验证事实」第 3 条。原始说明保留如下。
+  - （原文）补齐机器 A 入站的 `realitySettings.settings` sidecar（`publicKey` + `fingerprint`）。不补则面板的分享链接与订阅对该入站永久不可用，**第一版目标第 1 条（用户自助获取配置）无法交付**。公钥需从现有 privateKey 推导（`xray x25519`，参数拼法按固定版本核实）或从任一可用客户端配置的 `pbk` 取得；privateKey 本身不得变更，否则全部存量客户端失效。改的是活跃入站，须走 `POST /panel/api/inbounds/update/<id>` 并按上节的 30 秒重启窗口验证 pid。
+- ~~给 `make-inbound-payload.py` 补生成 `realitySettings.settings`~~ **2026-09-17 已完成**。新增 `--pbk` / `--xray-bin` / `--fingerprint` 三个参数：未给 `--pbk` 时用 `xray x25519 -i <privateKey>` 推导（解析 `Password (PublicKey):` 一行），两者都拿不到就直接退出且不产出文件，不再可能生成缺 sidecar 的 payload。已用合成的裸 Xray 配置实跑验证：sidecar 五键齐全、privateKey 原样保留、失败路径正确退出。
 - 机器 B 装 3x-ui（改 apt 源即可，不必等重装）。
 
 **被阻塞：**
