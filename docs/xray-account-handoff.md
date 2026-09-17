@@ -12,6 +12,8 @@
 
 2026-09-16 **切换已完成**：机器 A 的 443 已由面板管理的 Xray 26.7.28 接管，裸 Xray 26.2.6 已 `systemctl disable --now`。实测证据：`ss -ltunp` 显示同一进程（pid 26861）同时监听 `*:443`、`127.0.0.1:62789`（api 入站）与 `127.0.0.1:11111`（metrics），裸 Xray 进程已消失。用户确认迁移成功。**机器 A 自此完全由面板管理**，后续一切入站/客户端变更都必须经面板而非 `/usr/local/etc/xray/config.json`。详见「机器 A 迁移进度」第 8 条，其中列出了尚未记录的复核项。
 
+2026-09-17 状态更新：机器 A 新增第二个客户端 `zlz2026`，经 `rt.AddUser` 热更生效、核心未重启、现有用户未受影响。过程中对着源码核实出四条此前未知的约束（`compactOrphans` 静默剔除、30 秒自动重启窗口、`realitySettings.settings` sidecar 缺失导致链接/订阅不可用、`BulkCreate` 大小写使共享额度分裂），见下文「客户端管理的已验证事实（2026-09-17）」。其中第三条**卡住第一版目标第 1 条**，已进入待办队列。
+
 2026-09-16 当日三次更新（切换已解除阻塞，历史）：收窄后的必测清单 **v2rayN / Shadowrocket 2.2.92 / v2rayNG 全部通过 44300**，且是在核心版本经实测确认为 26.7.28、默认门槛活跃的前提下通过的。**机器 A 切换到 443 不再被客户端兼容性阻塞，且不需要任何配置改动。** 剩余风险与切换步骤见「客户端兼容性硬约束 → 验收结果」与「机器 A 迁移进度」。
 
 2026-09-16 当日二次修订（重要）：升级到最新版的 Shadowrocket 2.2.92 现在能连上 44300，但追查后**本文件初版对该约束的归因是错的，结论方向也反了**，已重写「客户端兼容性硬约束」整节。三点必须先知道：(1) `minClientVer` 默认门槛由 `af7eb680`（2026-07-11）引入、存续窗口仅 **v26.7.11 … v26.7.28**，并已被上游在 **v26.9.8** 注释掉——不是本文件原先写的「在 v26.3.27 进入」；(2) 机器 A 的 443 跑的裸 26.2.6 **根本没有这道闸**，所以切到面板 26.7.28 是**给生产端口新增限制**，兼容性净减少，不是「解除阻塞」；(3) 升级到 26.9.x 更糟——换成不可配置的 X25519MLKEM768 闸，且本仓库 Clash 订阅不输出 `support-x25519mlkem768`。**mihomo 硬编码自报 1.8.2 且维护者拒绝修改，因此「要求客户端升级」对 Clash 这一路不存在可行版本。**
@@ -375,6 +377,38 @@ mihomo 在 `component/tls/reality.go:74-76` 硬编码 `1.8.2`（Value=67586，�
 
 注意换 dest 会连带改 `serverNames`，而 `serverNames` 就是客户端的 `sni`——**所有客户端配置都要更新**。应作为一次独立的、计划好的变更，不要和迁移混在一起。
 
+## 客户端管理的已验证事实（2026-09-17）
+
+机器 A 新增第二个客户端 `zlz2026`（`user1` 之外）时，对着源码逐条核实并用对抗复核确认。全部为读码 + 实测所得，不是推断。
+
+**新增客户端走 `POST /panel/api/clients/add`。** 本 fork 有独立的 clients 控制器（`internal/web/controller/client.go`），不是经典 3x-ui 的 `inbounds/addClient`。请求体是 `{"client":{...},"inboundIds":[<id>]}`。UUID 与 `subId` 留空会自动生成（`client_crud.go:203` → `fillProtocolDefaults` `:242-244`）。
+
+1. **`compactOrphans` 会静默剔除孤儿客户端。** `client_inbound_apply.go:473` 在追加新客户端**之前**先跑 `compactOrphans`（`client_locks.go:42-92`），把入站 settings 里每个 email 拿去 `ClientRecord` 表查，**查不到的直接从入站配置里删掉**，接口仍返回 `{"success":true}`。面板 `/inbounds/add` 路径会调 `SyncInbound` 补表，所以正常导入的入站是安全的；但恢复的 x-ui.db、手工改过的 settings、被节点扫描软孤儿化的客户端不在此列。**新增客户端前必须比对**：入站 settings 里的 email 集合 ⊆ `clients` 表。2026-09-17 在机器 A 上实测为「无孤儿」，安全。
+
+2. **写客户端存在 30 秒自动重启窗口。** `web.go:322-325` 有 `cadenceXrayRestart = "@every 30s"` 的 cron 调 `ApplyPendingRestart()` → `RestartXray(false)`。`rt.AddUser` 任何一次失败都会置 `needRestart`（`client_inbound_apply.go:589-592`），控制器随即 `SetToNeedRestart()`。重启时会再试一次 `tryHotApply`，**只有热更再次失败才 `process.Stop()`**（`xray.go:1318-1326`）——那一刻整机所有连接断开。因此「核心没重启」的判据是**加完 60 秒后**比对 pid，立刻比对看不出来。这一条修正了此前「热更成功就不会重启」的过宽表述。
+
+3. **机器 A 的入站缺 `realitySettings.settings` sidecar，分享链接与订阅整体不可用。** 实测该入站的 `realitySettings` 只有 `['dest','privateKey','serverNames','shortIds']`——裸 Xray 服务端配置本来就不含公钥。而 `applyShareRealityParams`（`internal/sub/service.go:1617-1640`）的 `pbk` 与 `fp` 取自 `realitySettings.settings.{publicKey,fingerprint}` 这个**面板专用子块**，全仓库没有任何 Go 代码从 privateKey 反推 REALITY 公钥（只有 WireGuard 有 `PublicKeyFromPrivate`）。所以面板生成的链接缺 `pbk`/`fp`，客户端无法握手。**这直接卡住第一版目标第 1 条（用户自助获取配置）**，`make-inbound-payload.py` 当初未生成该块。当前绕法：取一条已能用的客户端链接，只替换 UUID——`pbk`/`sid`/`sni`/`flow` 全是入站级的，所有客户端相同。
+
+4. **`BulkCreate` 的大小写不一致会让共享额度静默分裂。** `client_bulk.go:1197` 用字节精确的 `db.Where("email IN ?")` 查已有记录，`:1201` 却用 `strings.ToLower(...)` 做 map 的键，`:1212` 的 subId 归属也已小写化——两道闸同时落空。用大小写变体 + 同一个 subId 再加一次，会创建**第二行** `clients` 记录，`created=1` 无警告，**同一个人变成两份额度**，正是共享额度机制要防的失败。子 agent 已实测复现。单客户端 `Create` 路径是封闭的（以 `subId already in use` 拒绝）。**规则：给已有的人挂第二个节点的入站，必须走 `/clients/:email/attach` 或单客户端 Create，禁止用 BulkCreate / CSV 导入。** 这与 email 是否为邮箱格式无关，`User2` vs `user2` 同样触发；据此本次选用全小写不透明 handle `zlz2026`。
+
+### 随之确认的操作性事实
+
+- **`totalGB` / 入站的 `total` 单位是字节，不是 GB。** 前端在提交前乘 `SizeFormatter.ONE_GB`（`ClientBulkAddModal.tsx:200`，`ONE_GB = 1073741824`）。填 `100` 实际是 100 字节。`0` = 不限量。
+- **`POST /clients/update/:email` 是全量替换，且请求体没有 `client` 外层包装**（直接绑 `model.Client`，与 `add` 的形状不同）。`id`/`password`/`auth`/`secret`/`subId`/`createdAt` 有显式保留逻辑（`client_crud.go:459-472`），`email` 强制必填；但 **`flow` 与 `enable` 没有任何保留**——省略即 `flow=""` + `enable=false`，用户被停用且握手被拒。每次 update 必须发完整对象。
+- **`flow` 在 xray-core 里是双向严格匹配**（`proxy/vless/inbound/inbound.go:552-598`）：服务端有 vision 而客户端没有，或反之，**两个方向都拒绝**，无降级兼容。因此 `disableFlow` 一旦置 true 会连坐入站上所有既有用户。
+- **`clientWithInboundFlow`（`client_crud.go:288-293`）只清空 flow，从不设置**，所以 `/clients/add` 必须显式传 `flow`。其判据 `!DisableFlow && inboundCanEnableTlsFlow(...)` 等价于 `GET /panel/api/inbounds/options` 返回的 `tlsFlowCapable` 字段，查这一个字段即可定论。注意 `inboundCanEnableTlsFlow`（`inbound_protocol.go:46-53`）的 switch 只认 `"tcp"` 与 `"xhttp"`，**不认 xray 新名 `"raw"`**——若入站 streamSettings 写的是 `raw`，flow 会被静默清空。机器 A 实测为 `tcp`，安全。
+- **`success:true` 不是成功判据。** flow 被清空、客户端被 `compactOrphans` 剔除，接口都照常返回成功。每次写操作后必须回读 `GET /panel/api/inbounds/get/<id>` 确认 `flow` 与 `enable`。
+- **客户端 IP 不依赖 Xray 访问日志。** `check_client_ip_job.go:32` 明确写 "no access log is involved"，数据来自核心的 online-stats gRPC API（`GetOnlineUsers`），每 10 秒一轮（`cadenceClientIPScan`）。`limitIp=0` 时仍然记录——`:507-515` 的分支注释为 "collection-only run"。所以面板默认 `access: "none"` 不影响查 IP。查法：`POST /panel/api/clients/ips/<email>`。这修正了此前「关了访问日志就看不到 IP」的推测。
+- **`GET /panel/api/inbounds/list` 返回的 `settings`/`streamSettings` 是 JSON 对象，不是转义字符串**；而 `/add` 两种都收。`model.Inbound` 的自定义 `MarshalJSON`/`UnmarshalJSON`（`model.go:188-217`）用 `json.RawMessage` + `jsonStringFieldFromRaw` 做双向兼容，Go 侧字段本身是 `string`。
+- **入站与节点是一对多，`client_inbounds` 是多对多关联表。** `Inbound.NodeID *int` 为 nil 表示面板本机的入站；`inbounds.id` 是面板库的全局自增主键，跨节点统一编号，不是「每个节点从 1 开始」。一个人（`clients` 表一行、一份额度）通过 `client_inbounds` 挂到多个节点的入站上——这就是共享额度在数据层的实现基础。`Inbound.Tag` 是 `gorm:"unique"`，**跨节点也不能重名**。
+
+### 机器 A 当前客户端
+
+| email | flow | 说明 |
+| --- | --- | --- |
+| `user1` | `xtls-rprx-vision` | 从裸 Xray 配置导入，服务真实用户 |
+| `zlz2026` | `xtls-rprx-vision` | 2026-09-17 新增，热更生效，未重启核心 |
+
 ## 下一阶段顺序
 
 1. ~~核实工作目录、分支及固定基线，阅读上述项目指导和安全证据~~ **已完成**。上游安全补丁的适用范围仍未核实。
@@ -394,6 +428,8 @@ mihomo 在 `component/tls/reality.go:74-76` 硬编码 `1.8.2`（Value=67586，�
 - ~~机器 A 切换到 443~~ **已完成（2026-09-16）**，见「机器 A 迁移进度」第 8 条。`is-enabled=disabled` 与 privateKey 哈希均已于 2026-09-17 复核通过。**仍缺**：v2rayNG 的版本号与其打包的 Xray 核心版本（本文件要求记录实际版本）。
 - **修 Clash 订阅缺 `support-x25519mlkem768`**（纯本机工作）：`internal/sub/clash_service.go:1067-1079` 的 `reality-opts` 只有 `public-key` / `short-id`。面板核心一旦到 ≥26.9.8，mihomo 订阅用户会静默失效。上游 `MHSanaei/3x-ui#6555` / `#6451`。与迁移无关，可独立推进。
 - **评估并移植三个上游安全补丁**（纯本机工作，不需要服务器）：`a31fa9abfa`（节点跨入站污染客户端凭据，GHSA-rr44-v4rv-x654——注册机器 B 为节点正是触发该问题的配置，所以这条最紧急）、`23511108bf`（数据目录 0700 / DB 0600，带测试）、`f294e1806d`（安装更新校验 SHA256 sidecar）。这是 S2 的前置条件。
+- **补齐机器 A 入站的 `realitySettings.settings` sidecar**（2026-09-17 新增，`publicKey` + `fingerprint`）。不补则面板的分享链接与订阅对该入站永久不可用，**第一版目标第 1 条（用户自助获取配置）无法交付**。公钥需从现有 privateKey 推导（`xray x25519`，参数拼法按固定版本核实）或从任一可用客户端配置的 `pbk` 取得；privateKey 本身不得变更，否则全部存量客户端失效。改的是活跃入站，须走 `POST /panel/api/inbounds/update/<id>` 并按上节的 30 秒重启窗口验证 pid。
+- **给 `make-inbound-payload.py` 补生成 `realitySettings.settings`**，避免机器 B 迁移时重蹈机器 A 的覆辙。
 - 机器 B 装 3x-ui（改 apt 源即可，不必等重装）。
 
 **被阻塞：**
