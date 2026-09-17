@@ -232,7 +232,7 @@
 ### 过程中踩到并确认的操作性事实
 
 - **`/usr/bin/x-ui` 是 shell 包装脚本，不接受 `setting` 子命令**（它自己的子命令表里是 `settings` 复数）。CLI 必须用二进制全路径 `/usr/local/x-ui/x-ui setting ...`。包装脚本内部也一律这么调。
-- **交互式安装的端口输入不支持方向键**，转义序列会被原样吃进参数。而 `install.sh:1217` 是把 username/password/port/webBasePath **四项放在一条命令**里设的，Go 的 flag 是 `ExitOnError`——端口解析失败会让整条退出，**四项一个都不生效**，面板于是停留在编译内置默认值 `admin`/`admin`、端口 2053、webBasePath `/`。安装摘要打印的却是它**打算**设置的值，具有误导性。绑回环之所以仍然生效，是因为 `install.sh:993` 是一次独立调用。
+- **交互式安装的端口输入不支持方向键**，转义序列会被原样吃进参数。而 `install.sh:1217` 是把 username/password/port/webBasePath **四项放在一条命令**里设的，Go 的 flag 是 `ExitOnError`——端口解析失败会让整条退出，**四项一个都不生效**，面板于是停留在编译内置默认值 `admin`/`admin`、端口 2053、webBasePath `/`。安装摘要打印的却是它**打算**设置的值，具有误导性。**2026-09-17 实测更正：这个失败模式在机器 A 上没有发生。** `/usr/local/x-ui/x-ui setting -show` 输出 `hasDefaultCredential: false`，加上端口 24476 与 18 位随机 webBasePath 都是自定义值，三者凑齐说明那条四合一命令实际执行成功了。本条保留为**其它机器上仍需提防的失败模式**，而不是机器 A 的现状。绑回环之所以仍然生效，是因为 `install.sh:993` 是一次独立调用。
 - **非交互模式强制不绑回环**（`install.sh:986-987` `bind_local="n"`，注释称云镜像需保持公网可达），必须装完手工补 `-listenIP 127.0.0.1`。
 - **`x-ui uninstall` 会 `rm /etc/x-ui/ -rf`**（连数据库和全部 API token 一起删），且 `x-ui.sh` 全文对裸 Xray 的三个路径零引用——所以卸载重装不会碰 443 上那个。确认提示里的 "xray will also uninstalled" 指的是面板自带的那份。
 - **`POST /panel/api/setting/update` 是全量覆盖**：它绑定整个 `AllSetting` 并调 `UpdateAllSetting`。只发单个键会把其余字段写成 Go 零值。正确用法是 `POST /setting/all` 导出 → 改一处 → 整份发回，服务端的 `preserveRedactedSecrets` 支持这种往返。
@@ -451,6 +451,64 @@ mihomo 在 `component/tls/reality.go:74-76` 硬编码 `1.8.2`（Value=67586，�
 **已知的残留**：Xray 核心里 `user>>>ChenXiang>>>traffic` 计数器不会消失（核心从不删计数器），但面板已无对应行，对它的更新命中 0 行后静默丢弃。影响仅为改名瞬间可能丢几秒增量，核心重启后自然消失。
 
 **这次改名安全的前提是三处拼写原本一致**。若已有漂移则不然：`client_inbound_apply.go:666-667` 会把 `oldEmail` 覆盖成 settings JSON 的拼写，而 `:949-956` 的 `clients` 改名与 `UpdateClientStat` 均以它为键且**都不检查 `RowsAffected`**——改名会 0 行匹配却返回成功，同时为新名插一行，**把一个身份劈成两个**。多入站客户端还有第二重风险：`client_crud.go:499-542` 按入站循环、遇错即返回，**没有跨入站事务**。`chenxiang` 只挂一个入站，故本次不适用。
+
+## 上游基线与停点分析（2026-09-17）
+
+### fork 与上游的关系是一条直线
+
+实测 `git rev-list --left-right --count`：**`origin/main` 相对上游三个参照点的「独有提交」全部为 0** —— 这个 fork 的 main **从未有过自己的代码改动**，只是落后。因此同步到上游任一点都是**纯快进、零冲突**。
+
+```
+v3.7.0 ──92──▶ origin/main ──68──▶ v3.8.0 ──39──▶ v3.8.5 ──7──▶ upstream/main
+              (fork, 09-10)         (09-14)        (09-16)       (09-17)
+```
+
+**关键认识：`origin/main` 不是一个候选停点。** 它是上游 main 在 09-10 的**任意开发快照**，位于 v3.8.0 之前 68 个提交，装的正是后来被 v3.8.0 发布测试揪出 27 个 bug 的那批在途代码。选它是两头不靠——既无 v3.7.0 的生产验证，也无 v3.8.5 的发布质量。
+
+### v3.8.0 应当否决，v3.8.5 可取
+
+`v3.8.0..v3.8.5` 共 39 个提交，**其中 27 个是 `fix`** —— v3.8.0 是带病发布。而 `v3.8.5..upstream/main`（1 天、7 个提交）只有 **44 文件 / +500 行**，内容是 CI 修复、节点错误文案、TG bot i18n、HWID 列表显示、图表单位，**无一是紧急热修**。对比 v3.8.0 之后两天的 474 文件 / +33,112 行，这个反差本身就是 v3.8.5 质量的证据。
+
+`v3.8.0..v3.8.5` 里有三条直接命中本项目已知问题：
+- `d440c2b9 fix(panel): accept 2FA codes from adjacent TOTP windows (#6546)` —— 修的正是下文「面板暴露就绪度」里点出的 2FA 无漂移窗口
+- `1d85ef13 fix(sub): prevent default profile page URL disclosure (#6538)` —— 订阅服务器信息泄露，而第一版计划要开订阅
+- `e790f467 fix(xray): restart when a diff strands a client's live session (#6550)`
+
+另有一整批 node 相关修复（`fan out operations`、`drop online clients of nodes no longer synced`、`push a node only the client IPs it hosts`、`release a deleted node's metric series`…）——**正是机器 B 上节点时要踩的路**。停在 v3.7.0 等于带着这批已知 bug 去做双节点。
+
+### `origin/main..v3.8.5` 的风险复核
+
+- **无破坏性迁移**。新增 4 个 seeder，**全部只碰 `settings` 表里 `key='xrayTemplateConfig'` 那一行**，不碰 `clients` / `client_traffics` / `inbounds`。整个 2.3 MB diff 里索引相关改动只有一处：给 `outbound_subscriptions` 加 `user_agent` 列。
+- **`xray-core` 模块 pin 逐字节相同**（`...-52a412d9e2f5`），所以合并不改变面板编译时链接的核心库版本。
+- **打包 pin 是 26.9.9**，但 `origin/main`（09-10）起就已经是，v3.8.5 没有回退。仅影响 `release.yml` 与 `DockerInit.sh`（后者只被 `Dockerfile` 调用），`make build` = `npm run build` + `go build ./...`，**一行都不碰 `bin/xray-linux-amd64`**。
+- **一个 seeder 会在本机真的触发**：`FreedomDomainStrategyFix`（`826e29e2`）。出厂模板的 freedom outbound 带 `"domainStrategy": "AsIs"`，被该 seeder 删除。语义是 no-op（AsIs 本就是核心默认），**但它仍会重写那一行**，而重写走 `json.MarshalIndent(map[string]any)`，会**把每个对象的键按字母重排、缩进重格式化，且无备份**。若面板的 Xray Configs 里有手工排过的 JSON，升级后会被打乱。
+- `67addab3 fix(inbounds): serve fresh client UUIDs for list and allLinks (#6458)` 把 `/panel/api/inbounds/list` 的数据来源从解析入站 settings JSON 改为读规范化的 `client_records` 表 —— 对本项目**是好事**，列表不再显示可能过期的 settings 快照。
+
+### 停点结论与执行顺序
+
+**停点定 v3.8.5**，但**合并的真正约束不是时机而是可验证性**：工作分支零代码改动，所以合并成本**一直**是最低、不随时间上升；而本机**没有 Go 工具链**，合完跑不了 `make verify`，等于盲合。
+
+因此顺序为：装 Go 工具链 → 合并 v3.8.5 → `make verify` → **机器 A 暂不升级**（代码基线与部署版本脱钩，升级仍按「等机器 B」处理）。
+
+**操作性事实**：本机 **HTTPS 连不上 github.com，SSH 可以**。用 `https://` 加 upstream remote 时 fetch 输出看似成功但 refs 一个都不落地；必须用 `git@github.com:MHSanaei/3x-ui.git`。
+
+## 面板暴露就绪度（2026-09-17 调查）
+
+管理员访问经 SSH 本地端口转发即可，**面板无需暴露**（`ssh -N -L 24476:127.0.0.1:24476`，浏览器开 `http://127.0.0.1:24476/<webBasePath>/`）。第一版目标第 1 条需要的是**订阅服务器**对外，不是面板 UI —— 用户要的是配置，把面板 UI 放到公网只增加攻击面、不增加用户价值。
+
+暴露前的既有事实：
+
+- **登录本身比预期结实**：真 bcrypt（cost 10）、真的每 IP 锁定（5 次 / 5 分钟 → 封 15 分钟，键为 IP+小写用户名）、真 CSRF、会话经 `LoginEpoch` 可即时吊销。但锁定表是**进程内 map，重启即清零、多节点不共享**，且对分布式换源 IP 的爆破无效。
+- **2FA 默认关**（`twoFactorEnable` 默认 `false`）。三件套做全仍是单因素。
+- **fail2ban 在机器 A 上跳过没装**，而仓库唯一会装的 jail 是 `3x-ipl`，只读代理 IP 限制日志、且 actionban **明确把面板端口列入豁免**；它探测 SSH 端口是为了把 SSH 从代理封禁里**豁免**出去，从来不是保护 SSH。**面板登录与 SSH 爆破都没有任何自动封禁。**
+- **TLS 配置失败会静默降级成 HTTP**：`web.go:577-601` 在 `tls.LoadX509KeyPair` 失败后复用已建好的明文 listener，只打一行 ERROR，紧跟的 Info 行与「从未配置 TLS」那行逐字相同；条件是 `||` 不是 `&&`，**清空 certFile / keyFile 任一字段即触发**。同一次失败还同时抹掉 HSTS 与 Cookie 的 `Secure`（`:166-167`、`:204`），三者自洽到没有外部可观测痕迹。
+- **订阅服务器零认证**：整条中间件链没有 session、没有 token、也没有面板那边的 `SecurityHeadersMiddleware` 与 body limit。**唯一的秘密就是路径参数 `:subid`**，泄露一条订阅 URL 等于泄露该客户端的完整配置（含 UUID）。本机现有客户端的 subId 是 122 位 UUID（走 API 生成），但 `validateClientSubID` **不强制任何最小熵**，管理员手打 `alice` 也会被接受。
+- **API token 与管理员密码等价**：API token 路由按设计豁免 CSRF（`middleware/security.go:43-46`）。
+- 凭据现状见上文更正：`hasDefaultCredential: false`，非默认口令。
+
+### 已知并明确接受的风险
+
+**`systemctl mask xray` 经用户决定不执行（2026-09-17）。** 因此残留风险照旧：`disabled` 只阻止开机自启，**手动 `systemctl restart xray` 仍会拉起 26.2.6 去抢 443**。最坏情况是它赶上面板 Xray 重启的窗口抢到端口，于是对外服务的是旧配置——只有 `user1`，没有 `zlz2026` / `chenxiang`，且退回无 `minClientVer` 闸的 26.2.6，**新客户端静默失效而面板显示异常、外部看 443 却是通的**。记录在此，不再重复建议。
 
 ## 客户端 email 大小写：完整风险面（2026-09-17 更正）
 
