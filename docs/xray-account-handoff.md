@@ -12,7 +12,7 @@
 
 2026-09-16 **切换已完成**：机器 A 的 443 已由面板管理的 Xray 26.7.28 接管，裸 Xray 26.2.6 已 `systemctl disable --now`。实测证据：`ss -ltunp` 显示同一进程（pid 26861）同时监听 `*:443`、`127.0.0.1:62789`（api 入站）与 `127.0.0.1:11111`（metrics），裸 Xray 进程已消失。用户确认迁移成功。**机器 A 自此完全由面板管理**，后续一切入站/客户端变更都必须经面板而非 `/usr/local/etc/xray/config.json`。详见「机器 A 迁移进度」第 8 条，其中列出了尚未记录的复核项。
 
-2026-09-17 状态更新：机器 A 新增第二个客户端 `zlz2026`，经 `rt.AddUser` 热更生效、核心未重启、现有用户未受影响。过程中对着源码核实出四条此前未知的约束（`compactOrphans` 静默剔除、30 秒自动重启窗口、`realitySettings.settings` sidecar 缺失导致链接/订阅不可用、`BulkCreate` 大小写使共享额度分裂），见下文「客户端管理的已验证事实（2026-09-17）」。其中第三条**曾卡住第一版目标第 1 条**，**当日已修复**——sidecar 已补齐、链接带上 `pbk`/`fp`、核心零影响，`make-inbound-payload.py` 亦已补上生成逻辑，机器 B 不会重蹈。
+2026-09-17 状态更新：机器 A 新增第二个客户端 `zlz2026`，经 `rt.AddUser` 热更生效、核心未重启、现有用户未受影响。过程中对着源码核实出四条此前未知的约束（`compactOrphans` 静默剔除、30 秒自动重启窗口、`realitySettings.settings` sidecar 缺失导致链接/订阅不可用、`BulkCreate` 大小写使共享额度分裂），见下文「客户端管理的已验证事实（2026-09-17）」。当日另有一次升级评估实验，见「升级到 v3.8.x 的实测代价（2026-09-17）」——结论是 26.9.9 会切断 Shadowrocket，机器 A 暂不升级、暂不移植补丁。四条约束里第三条**曾卡住第一版目标第 1 条**，**当日已修复**——sidecar 已补齐、链接带上 `pbk`/`fp`、核心零影响，`make-inbound-payload.py` 亦已补上生成逻辑，机器 B 不会重蹈。
 
 2026-09-16 当日三次更新（切换已解除阻塞，历史）：收窄后的必测清单 **v2rayN / Shadowrocket 2.2.92 / v2rayNG 全部通过 44300**，且是在核心版本经实测确认为 26.7.28、默认门槛活跃的前提下通过的。**机器 A 切换到 443 不再被客户端兼容性阻塞，且不需要任何配置改动。** 剩余风险与切换步骤见「客户端兼容性硬约束 → 验收结果」与「机器 A 迁移进度」。
 
@@ -415,6 +415,89 @@ mihomo 在 `component/tls/reality.go:74-76` 硬编码 `1.8.2`（Value=67586，�
 | `user1` | `xtls-rprx-vision` | 从裸 Xray 配置导入，服务真实用户 |
 | `zlz2026` | `xtls-rprx-vision` | 2026-09-17 新增，热更生效，未重启核心 |
 
+## 升级到 v3.8.x 的实测代价（2026-09-17）
+
+起因是一个被质疑的前提。此前待办写的是「评估并移植三个上游安全补丁」，但用户反问「如果要在 v3.7.0 上打补丁，为什么不一开始就装更高版本」。核实后该质疑成立：**三个补丁全部包含在稳定版 v3.8.0 里**（`git tag --contains` 实测，不是仅在 `dev-latest`），所以「移植 + 自建构建」并非必需成本，而是需要先与升级对比的一个选项。
+
+但升级有它自己的代价，已用实验量化。
+
+### 版本对应关系
+
+| 面板版本 | 打包的 xray-core | reality 库 |
+| --- | --- | --- |
+| v3.7.0（机器 A 当前） | 26.7.28 | `20260322125925-9234c772ba8f` |
+| v3.8.0 / v3.8.5 | 26.9.9 | `20260910011853-5dabb073f8e8` |
+
+### 两版 reality 的实际差异（读源码，非复述）
+
+旧版（v3.7.0）：X25519 够用，MLKEM 只是回退。
+
+```go
+for _, keyShare := range hs.clientHello.keyShares {
+    if keyShare.group == X25519 && len(keyShare.data) == 32 { peerPub = keyShare.data; break }
+}
+if peerPub == nil {   // 仅当 X25519 缺席才找 MLKEM
+    for _, keyShare := range ... { if keyShare.group == X25519MLKEM768 { ... } }
+}
+```
+
+新版（v3.8.x），`tls.go:214-238`：
+
+```go
+if peerPub2 == nil {
+    break // reject outdated/strange Client Hello that doesn't have X25519MLKEM768 before optional X25519
+}
+```
+
+`peerPub2` 是 MLKEM key_share，**必须存在**，且必须排在可选的 X25519 **之前**（X25519 分支是 `break // ensure order`，先遇到它循环就停，`peerPub2` 仍为 nil → 拒绝）；重复 key_share 也判失败（`ensure once`）。**这个拒绝发生在读配置之前**，`MinClientVer`/`MaxClientVer`/`MaxTimeDiff`/`ShortIds` 四条合取在它后面——所以**没有任何配置开关能放宽它**。注意四条合取本身两版一致，新版并未移除 `MinClientVer`，只是出厂默认不再设值。
+
+### 实验：单独跑 26.9.9 核心在临时端口
+
+**不装 v3.8.5**，因为那会连面板带核心一起换掉，而面板正管着 443。这道闸在 xray-core 里、与面板无关，所以只需独立进程 + 独立配置 + 独立端口，复用生产 REALITY 密钥使客户端**只有端口一个变量**变化。生产 443 即天然对照组。面板与生产核心全程未被触碰，pid 未变，实验后配置（含私钥副本）已删除。
+
+| 客户端 | 26.7.28（生产 443） | 26.9.9（临时端口） |
+| --- | --- | --- |
+| v2rayN 7.24.9 / Windows | 通过 | **通过** |
+| Shadowrocket 2.2.92 / iOS | 通过 | **失败**（`fp` 取 chrome / firefox / safari 三值均失败） |
+| v2rayNG | 通过 | 未测 |
+
+**v2rayN 通过即证明环境无问题**——端口可达、无防火墙拦截、privateKey/shortIds/serverNames 全对。故 Shadowrocket 的失败归于客户端自身。
+
+### 失败机制已确证（不是推定）
+
+Shadowrocket 每次尝试的服务端 `show` 输出只有三行，随后转发给 dest：
+
+```
+REALITY remoteAddr: <ip>:22846
+REALITY remoteAddr: <ip>:22846	forwarded SNI: www.apple.com
+REALITY remoteAddr: <ip>:22846	hs.c.isHandshakeComplete.Load(): false
+[Info] REALITY: processed invalid connection from <ip>:22846: authentication failed or validation criteria not met
+```
+
+**关键是缺了 `hs.c.AuthKey[:16]`、`hs.c.ClientVer`、`hs.c.ClientShortId` 与 `hs.c.conn == conn` 四行。** 连 `conn == conn` 都没打，说明走的是 `peerPub2 == nil` 那个**跳出外层循环**的 break——它绕过了该打印。若是 shortId 错或时钟偏移，会先算 AuthKey、解密、打印 `ClientVer`/`ClientShortId`，最后打 `conn == conn: false`，日志形状完全不同。
+
+同签名的另两条提前 break 已排除：SNI 不匹配（`forwarded SNI` 正是配置的 serverName，且 v2rayN 用同一份配置通过，证明 `ServerNames` 映射含它）、TLS 版本低于 1.3（该检查两版都有，而 Shadowrocket 在 26.7.28 上通过）。**故确证为 MLKEM 闸。**
+
+Shadowrocket 是闭源 iOS 客户端、TLS 栈自研（非 uTLS），其 `fp` 留空时的默认值不可知；但上游在引入该闸的同一提交里把已知可用 uTLS 指纹收窄到 `{chrome, firefox, safari}`，三者全试均失败，说明瓶颈在其 TLS 栈本身而非指纹选择——**服务端无补救，只能等客户端更新**。（参考：xray-core 侧 `fp` 留空等于 `chrome`——`tls.go:187-190` 的 `GetFingerprint` 对空值返回 `HelloChrome_Auto`。）
+
+### 由此得到三条路，各有明确代价
+
+| 方案 | 三个安全修复 | 其余 ~100 提交 | 需自建构建 | iOS/Shadowrocket |
+| --- | --- | --- | --- | --- |
+| 留在 v3.7.0 + 移植补丁 | 手工移植 | 拿不到 | **要** | 保住 |
+| 升到 v3.8.5（原样） | 白拿 | 白拿 | 不要 | **切断** |
+| **v3.8.5 面板 + 钉住 26.7.28 核心** | 白拿 | 白拿 | 不要 | 保住 |
+
+第三条技术上成立，已核实两个前提：**面板不检查核心版本**（`process.go:578-589` 的 `refreshVersion` 只执行 `xray -version` 存字符串供显示，无比较无下限；`OnlineAPISupport` 是运行时能力探测并缓存，老核心缺该 API 会优雅降级）；**xray-core 不拒绝未知配置字段**（26.7.28 全代码无 `DisallowUnknownFields`，新面板吐出的新字段被静默忽略）。且三个补丁全在面板侧 Go 代码与安装脚本，无一触及 xray-core。配置模板 v3.7.0→v3.8.5 仅删除 freedom 出站的 `"domainStrategy": "AsIs"`（删字段对老核心无害）。
+
+第三条的代价：依赖新核心字段的新功能静默失效；该搭配**上游未测试**；**每次面板更新 `install.sh` 会重新下载配套核心，静默撤销这个钉死**，需单独防护。风险上限是那个已知的灾难模式——核心无法载入配置时整机所有入站一起挂，且 `CheckXrayRunningJob` 会每约 2 秒重启死核心不止。
+
+### 时序结论：现在不动机器 A
+
+`a31fa9abfa`（GHSA-rr44-v4rv-x654）的触发条件是**已登记的节点**跨入站认领客户端凭据，不是匿名远程入口。机器 A 当前：**未注册任何节点**、订阅服务器已关（`subEnable=false`）、面板绑 `127.0.0.1`。**故当前无暴露面。** 此前「必须赶在机器 B 之前打完」的方向正确，但推成「现在就得做」过快了。
+
+因此：机器 A 保持现状（生产、有真实用户、零暴露面，不值得为触发条件尚不存在的漏洞冒维护窗口风险）。**待机器 B 可用时在其上先验第三条路**——它无用户，且本来就要装面板、本来就要注册成节点，把该评估并入迁移，边际成本接近零。机器 B 长期不可用则重新评估。
+
 ## 下一阶段顺序
 
 1. ~~核实工作目录、分支及固定基线，阅读上述项目指导和安全证据~~ **已完成**。上游安全补丁的适用范围仍未核实。
@@ -432,8 +515,8 @@ mihomo 在 `component/tls/reality.go:74-76` 硬编码 `1.8.2`（Value=67586，�
 
 - ~~在 44300 上测 v2rayNG 并复测 Shadowrocket~~ **已完成（2026-09-16）**，三个必测客户端全通过。
 - ~~机器 A 切换到 443~~ **已完成（2026-09-16）**，见「机器 A 迁移进度」第 8 条。`is-enabled=disabled` 与 privateKey 哈希均已于 2026-09-17 复核通过。**仍缺**：v2rayNG 的版本号与其打包的 Xray 核心版本（本文件要求记录实际版本）。
-- **修 Clash 订阅缺 `support-x25519mlkem768`**（纯本机工作）：`internal/sub/clash_service.go:1067-1079` 的 `reality-opts` 只有 `public-key` / `short-id`。面板核心一旦到 ≥26.9.8，mihomo 订阅用户会静默失效。上游 `MHSanaei/3x-ui#6555` / `#6451`。与迁移无关，可独立推进。
-- **评估并移植三个上游安全补丁**（纯本机工作，不需要服务器）：`a31fa9abfa`（节点跨入站污染客户端凭据，GHSA-rr44-v4rv-x654——注册机器 B 为节点正是触发该问题的配置，所以这条最紧急）、`23511108bf`（数据目录 0700 / DB 0600，带测试）、`f294e1806d`（安装更新校验 SHA256 sidecar）。这是 S2 的前置条件。
+- **修 Clash 订阅缺 `support-x25519mlkem768`**（纯本机工作，2026-09-17 起是队列里优先级最高的未阻塞项）：`internal/sub/clash_service.go:1067-1079` 的 `reality-opts` 只有 `public-key` / `short-id`。面板核心一旦到 ≥26.9.8，mihomo 订阅用户会静默失效。上游 `MHSanaei/3x-ui#6555` / `#6451`。与迁移无关，可独立推进。
+- ~~评估并移植三个上游安全补丁~~ **2026-09-17 重新定性：改为等机器 B，不再是「立即推进」项。** 三个补丁（`a31fa9abfa` GHSA-rr44-v4rv-x654 / `23511108bf` / `f294e1806d`）全部包含在稳定版 **v3.8.0** 中，所以「手工移植 + 自建构建」不是唯一路径；而 `a31fa9abfa` 的触发条件是已登记节点，机器 A 当前零节点、订阅已关、面板绑回环，**无暴露面**。完整比较与实验证据见「升级到 v3.8.x 的实测代价（2026-09-17）」。结论：机器 A 保持现状，待机器 B 可用时在其上先验「v3.8.5 面板 + 钉住 26.7.28 核心」。仍是 S2 的前置条件，只是不再有当下的时间压力。
 - ~~补齐机器 A 入站的 `realitySettings.settings` sidecar~~ **2026-09-17 已完成**，见「客户端管理的已验证事实」第 3 条。原始说明保留如下。
   - （原文）补齐机器 A 入站的 `realitySettings.settings` sidecar（`publicKey` + `fingerprint`）。不补则面板的分享链接与订阅对该入站永久不可用，**第一版目标第 1 条（用户自助获取配置）无法交付**。公钥需从现有 privateKey 推导（`xray x25519`，参数拼法按固定版本核实）或从任一可用客户端配置的 `pbk` 取得；privateKey 本身不得变更，否则全部存量客户端失效。改的是活跃入站，须走 `POST /panel/api/inbounds/update/<id>` 并按上节的 30 秒重启窗口验证 pid。
 - ~~给 `make-inbound-payload.py` 补生成 `realitySettings.settings`~~ **2026-09-17 已完成**。新增 `--pbk` / `--xray-bin` / `--fingerprint` 三个参数：未给 `--pbk` 时用 `xray x25519 -i <privateKey>` 推导（解析 `Password (PublicKey):` 一行），两者都拿不到就直接退出且不产出文件，不再可能生成缺 sidecar 的 payload。已用合成的裸 Xray 配置实跑验证：sidecar 五键齐全、privateKey 原样保留、失败路径正确退出。
