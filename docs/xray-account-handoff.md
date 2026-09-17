@@ -396,6 +396,8 @@ mihomo 在 `component/tls/reality.go:74-76` 硬编码 `1.8.2`（Value=67586，�
 
 4. **`BulkCreate` 的大小写不一致会让共享额度静默分裂。** `client_bulk.go:1197` 用字节精确的 `db.Where("email IN ?")` 查已有记录，`:1201` 却用 `strings.ToLower(...)` 做 map 的键，`:1212` 的 subId 归属也已小写化——两道闸同时落空。用大小写变体 + 同一个 subId 再加一次，会创建**第二行** `clients` 记录，`created=1` 无警告，**同一个人变成两份额度**，正是共享额度机制要防的失败。子 agent 已实测复现。单客户端 `Create` 路径是封闭的（以 `subId already in use` 拒绝）。**规则：给已有的人挂第二个节点的入站，必须走 `/clients/:email/attach` 或单客户端 Create，禁止用 BulkCreate / CSV 导入。** 这与 email 是否为邮箱格式无关，`User2` vs `user2` 同样触发；据此本次选用全小写不透明 handle `zlz2026`。
 
+   **2026-09-17 重大更正：上面那条规则给的是假安全感，风险面比这里写的大得多。** 逐路径复核后，「禁止用 BulkCreate」堵住的只是三条路里最不常用的一条，而放开了日常真正在走的那条。详见「客户端 email 大小写：完整风险面」。
+
 ### 随之确认的操作性事实
 
 - **`totalGB` / 入站的 `total` 单位是字节，不是 GB。** 前端在提交前乘 `SizeFormatter.ONE_GB`（`ClientBulkAddModal.tsx:200`，`ONE_GB = 1073741824`）。填 `100` 实际是 100 字节。`0` = 不限量。
@@ -449,6 +451,37 @@ mihomo 在 `component/tls/reality.go:74-76` 硬编码 `1.8.2`（Value=67586，�
 **已知的残留**：Xray 核心里 `user>>>ChenXiang>>>traffic` 计数器不会消失（核心从不删计数器），但面板已无对应行，对它的更新命中 0 行后静默丢弃。影响仅为改名瞬间可能丢几秒增量，核心重启后自然消失。
 
 **这次改名安全的前提是三处拼写原本一致**。若已有漂移则不然：`client_inbound_apply.go:666-667` 会把 `oldEmail` 覆盖成 settings JSON 的拼写，而 `:949-956` 的 `clients` 改名与 `UpdateClientStat` 均以它为键且**都不检查 `RowsAffected`**——改名会 0 行匹配却返回成功，同时为新名插一行，**把一个身份劈成两个**。多入站客户端还有第二重风险：`client_crud.go:499-542` 按入站循环、遇错即返回，**没有跨入站事务**。`chenxiang` 只挂一个入站，故本次不适用。
+
+## 客户端 email 大小写：完整风险面（2026-09-17 更正）
+
+存储层与查询层的语义是**分裂**的，而此前记录只抓到了其中一条支路。
+
+**分裂的根源**：`clients.email` 是 `gorm:"uniqueIndex"`、`client_traffics.email` 是 `gorm:"unique"`，两者在 SQLite 默认 BINARY 排序下**大小写敏感**，所以 `ChenXiang` 与 `chenxiang` 可以并存为两行；而部分身份查询按 `LOWER(email)` 折叠（`inbound.go:505,531`，`db.go:362` 还专门建了 `idx_clients_email_lower` 表达式索引，且该索引**非唯一、不强制任何约束**）。测试文件 `client_identity_normalized_test.go:78-79` 把这个语义写得很明白：「clients 表按输入原样存储于大小写敏感的唯一索引下，所以普通 IN 查询会漏掉」。
+
+**真正的 INSERT 点不是 `BulkCreate`，是 `syncInboundClients`**（`client_link.go:120-172`）：字节精确查 `Where("email IN ?")`、字节精确建 map、查不到即 `tx.CreateInBatches` ——**零折叠、零拒绝、零日志**。调用它的路径包括：
+
+- **`UpdateInbound`（`inbound.go:1723`）—— 该函数全程没有任何 duplicate-email 检查**，与 `AddInbound`（`inbound.go:980-985` 有检查）不同。而 `GET /inbounds/get/1` → 改 JSON → `POST /inbounds/update/1` **正是本项目 09-17 补 REALITY sidecar 时走的那条流程**。
+- **每 5 秒的流量轮询**（`inbound_traffic.go:302`、`:505`）。
+- 节点快照合并（`inbound_node.go:1187`）、批量调整/删除/启用（`client_bulk.go:669,1040,1600`）、迁移（`inbound_migration.go:195,320`）。
+
+**后果**：只要入站 settings JSON 里的 email 拼写与 `clients` 行差一个大小写，**一个 cron job 就会自动铸出第二行，不需要任何人操作**。这比 `BulkCreate` 危险得多，因为它是无人值守的。
+
+**另外两条此前未记的入口**：
+
+- `ImportClients` 的**孤儿分支**（`client_portable.go:133-168`）：字节精确 `Count` 判重后**直接 `db.Create(rec)`**，完全不经 `AddInboundClient` 的 `LOWER` 守卫，大小写变体被计为 `Created` 且报成功。
+- `/clients/:email/attach` **不是拒绝而是找不到人**：`GetRecordByEmail` 用 `Where("email = ?")`（`client_lookup.go:21`），大小写不符直接 `ErrRecordNotFound`；而当另一变体已挂在该入站上时，`AddInboundClient` 会**静默返回 `(false, nil)`**（`client_inbound_apply.go:384-386`），控制器仍报 `inboundClientAddSuccess` 而实际什么都没挂上。
+
+**删除侧也不对称**：`DelClientStat` 字节精确，但 `DelDepletedClients` 用 `LOWER(email) IN ?`（`inbound_traffic.go:976`）——**一次会抹掉两个变体的流量行**。
+
+**上游没有修这个问题。** `origin/main..v3.8.5` 的完整 diff 里与 email 相关的索引/约束改动为零，既没修也没恶化。
+
+**因此规则要改写**：
+1. 所有 handle **一律全小写、不透明**（面板 Add Client 的 Email 生成按钮产出的就是这种，手打姓名才会出问题）。
+2. 给已有的人挂入站，走 `/clients/:email/attach` 或单客户端 `Create`，**禁止 BulkCreate / CSV 导入**（此条仍然有效，只是不充分）。
+3. **任何手工改写入站 settings JSON 的流程，必须保证其中 email 与 `clients` 行逐字节一致**——这是新增的、也是最要紧的一条，因为漂移会被流量轮询自动物化成第二行。
+4. 改任何客户端 email 前，先做 `hex(email)` 三方比对（`clients` / `client_traffics` / 入站 settings）。
+
+**根治需要代码改动**（写入时归一化，或给唯一索引加 NOCASE），属于行为变更，须单独立项并与 CLAUDE.md「改动幅度匹配问题幅度」一并权衡，**不要顺手做**。
 
 ## 热更可靠性：实测结论（2026-09-17）
 
