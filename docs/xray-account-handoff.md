@@ -56,7 +56,7 @@
 
 - 工作目录：`D:\workspaces\3x-ui`，是 Noctiluca 的同级独立仓库，不是子模块。
 - 开发分支：`codex/xray-account`。
-- 代码基线：`v3.7.0`，SHA `f727d04f6522bb94a8fb52e8352fdcafb51c11e1`。
+- 代码基线：~~`v3.7.0`，SHA `f727d04f6522bb94a8fb52e8352fdcafb51c11e1`~~ **2026-09-18 起为上游 `v3.8.5`**（合并提交 `881d5d18`）。本分支从 v3.7.0 分出，除 `docs/` 与 `AGENTS.md` 外没有自己的代码，合并后在这两处之外与 v3.8.5 逐字节相同（合并前用 `git merge-tree` 预演，所得树与 v3.8.5 做 diff 为空，实际合并树的哈希与预演一致）。**注意：本文件 2026-09-18 之前记录的文件与行号引用指向 v3.7.0**，在 v3.8.5 上可能已移位或已被上游修改；S0/S1 的关键结论须在 S3 之前对 v3.8.5 重新核对。
 - 从此前只读审查的本地上游副本进行独立克隆（无硬链接），上游 remote 已指向 `https://github.com/MHSanaei/3x-ui.git`。
 - 用户已创建 GitHub Fork：`zhss5/3x-ui`；`origin` 已配置为 `git@github.com:zhss5/3x-ui.git`，官方仓库保留为 `upstream`。
 - 2026-09-11 已将现有基线分支 `codex/xray-account` 推送到 `origin` 并建立同名分支跟踪；后续设计及证据文件的提交、发布状态以 `git status`、本地提交和远程分支为准，基线发布不代表账户功能已经发布。
@@ -170,7 +170,7 @@
 
 **本仓库钉的 Xray 版本不等于机器 A 上那个。** 二进制版本钉在三处并同步：`DockerInit.sh:35`、`.github/workflows/release.yml:127` 与 `:290`。`v3.7.0`（机器 A 安装的版本，2026-08-24）钉 **v26.7.28**；当前 `main` 自 `d0edbcec`（2026-09-09）起钉 **v26.9.9**。Go 模块 `github.com/xtls/xray-core` 只提供 config 结构体与 gRPC stats/handler/router API，不是运行时核心：v3.7.0 为 `...-5ca6f4b7d4dc`（即 26.7.28），main 为 `...-52a412d9e2f5`；间接依赖 `github.com/xtls/reality` 在 v3.7.0 是 `20260322125925`、main 是 `20260908062103`。**所以升级面板会把核心从 26.7.28 推到 26.9.9，跨过上游撤回 `minClientVer` 默认值并换上 MLKEM768 闸的那道分界线。** 面板另有独立于面板版本的 Xray 二进制切换器（`POST /server/installXray/:version`，下限 v26.6.27），但其选择不持久，下次 `x-ui update` 会被覆盖。
 
-**分支陷阱（已经害人一次）**：本文件所在的 `codex/xray-account` 分支是从 `v3.7.0` 分出的，所以它的工作树里 `DockerInit.sh:35` 仍是 v26.7.28、`go.mod` 的 `reality` 仍是 `20260322125925`——**与 `main` 不同**。在本分支上 grep 出来的版本号不代表 `main` 会发布什么，反之亦然。判断「门槛在不在」时必须先说清问的是哪个分支、哪个发布、还是机器 A 上那个运行中的二进制，这三者当前互不相同。
+**分支陷阱（已经害人一次）**：~~本文件所在的 `codex/xray-account` 分支是从 `v3.7.0` 分出的，所以它的工作树里 `DockerInit.sh:35` 仍是 v26.7.28、`go.mod` 的 `reality` 仍是 `20260322125925`——与 `main` 不同。~~ **2026-09-18 合并 v3.8.5 之后情况反转**：本分支工作树里 `DockerInit.sh` 钉的是 **v26.9.9**，`go.mod` 的 `xray-core` 为 `...-52a412d9e2f5`、`reality` 为 `20260910011853-5dabb073f8e8`——**与机器 A 上实际运行的 26.7.28 不同**。陷阱的方向变了但性质没变：在本分支上 grep 出来的版本号，不代表机器 A 上跑的是什么。判断「门槛在不在」时必须先说清问的是哪个分支、哪个发布、还是机器 A 上那个运行中的二进制，这三者当前互不相同。
 
 **机器 B 目前无法重装系统**：服务商（hmbcloud）的 WHMCS 面板 VPS 管理区空白。已定位到具体原因——`clientarea.php?action=productdetails&id=5973&api=json&act=vpsmanage` 返回 HTTP 200 但 `"info": 0`（应为 VPS 详情对象），耗时 0.889s；同账号另一台 VPS（id 7094 / vpsid 662 / 节点 DC0605）同一接口返回完整 `info` 对象，耗时 0.542s。两者 `uid` 均为 0、`user_type` 均为 null，故**认证层无差异，认证问题已排除**。字段集合差异（异常那台多出 `pubkey`/`enable_kyc`/`vpc_attachments`/`custom_cp` 等）显示两台由不同版本的 Virtualizor 主控服务。VPS 385 本身运行正常（可 SSH、业务正常），故问题在承载它的 DC5 主控侧。前端崩溃点已定位：`map_address` 位于 `info.flags` 下，`info=0` 时 `info.flags` 为 undefined，`vpsmanage_onload` 抛 TypeError 中断整个面板渲染。已备工单文本，服务商 WAF 会拦含 HTML 标签与完整 URL 的正文，需用纯文本版本提交。
 
