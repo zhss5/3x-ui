@@ -9,6 +9,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"fmt"
 	"net"
 	"os"
@@ -16,11 +17,52 @@ import (
 	"time"
 
 	"github.com/vishvananda/netlink"
+	"github.com/vishvananda/netlink/nl"
 	"golang.org/x/sys/unix"
 )
 
 type outcome struct {
-	netlinkKilled, ssKilled, foundV4, foundV6 bool
+	netlinkKilled, v6Killed, ssKilled, foundV4, foundV6 bool
+}
+
+// netlink 库的 socketRequest 是非导出类型，这里照抄它的线格式（56 字节）。
+// 它的 Serialize 本就正确处理 AF_INET6，被挡住的只是 SocketDestroy 的 To4() 闸门。
+const sizeofSocketRequest = 56
+
+type socketRequest6 struct {
+	SourcePort, DestinationPort uint16
+	Source, Destination         net.IP
+}
+
+func (r *socketRequest6) Len() int { return sizeofSocketRequest }
+
+func (r *socketRequest6) Serialize() []byte {
+	native := nl.NativeEndian()
+	b := make([]byte, sizeofSocketRequest)
+	b[0] = unix.AF_INET6
+	b[1] = unix.IPPROTO_TCP
+	native.PutUint32(b[4:8], 0) // States：销毁请求按四元组精确匹配，不按状态筛
+	binary.BigEndian.PutUint16(b[8:10], r.SourcePort)
+	binary.BigEndian.PutUint16(b[10:12], r.DestinationPort)
+	copy(b[12:28], r.Source.To16())
+	copy(b[28:44], r.Destination.To16())
+	native.PutUint32(b[44:48], 0) // Interface
+	native.PutUint32(b[48:52], nl.TCPDIAG_NOCOOKIE)
+	native.PutUint32(b[52:56], nl.TCPDIAG_NOCOOKIE)
+	return b
+}
+
+// destroyV6 是 netlink.SocketDestroy 的 AF_INET6 版本，用于真 IPv6 对端。
+func destroyV6(local, remote *net.TCPAddr) error {
+	req := nl.NewNetlinkRequest(nl.SOCK_DESTROY, unix.NLM_F_ACK)
+	req.AddData(&socketRequest6{
+		SourcePort:      uint16(local.Port),
+		DestinationPort: uint16(remote.Port),
+		Source:          local.IP.To16(),
+		Destination:     remote.IP.To16(),
+	})
+	_, err := req.Execute(unix.NETLINK_INET_DIAG, 0)
+	return err
 }
 
 func main() {
@@ -41,8 +83,8 @@ func main() {
 	fmt.Println("=== 结论 ===")
 	fmt.Printf("  用例1 纯 IPv4 对照组      ：netlink 销毁 %s\n", yn(c1.netlinkKilled))
 	fmt.Printf("  用例2 双栈 + IPv4 客户端  ：netlink 销毁 %s\n", yn(c2.netlinkKilled))
-	fmt.Printf("  用例3 双栈 + 真 IPv6 客户端：netlink 销毁 %s（ss -K 回退 %s）\n",
-		yn(c3.netlinkKilled), yn(c3.ssKilled))
+	fmt.Printf("  用例3 双栈 + 真 IPv6 客户端：库 %s，自建 AF_INET6 请求 %s，ss -K %s\n",
+		yn(c3.netlinkKilled), yn(c3.v6Killed), yn(c3.ssKilled))
 	fmt.Printf("  枚举：用例2 连接在 AF_INET 中%s、AF_INET6 中%s\n",
 		foundStr(c2.foundV4), foundStr(c2.foundV6))
 	fmt.Println()
@@ -53,12 +95,15 @@ func main() {
 		fmt.Println("  → 主流形态（IPv4 客户端）就断不掉，方案需重新考虑。")
 	case c3.netlinkKilled:
 		fmt.Println("  → 现成 netlink 库对 v4/v6 两种客户端都可用，无需手写请求。")
+	case c3.v6Killed:
+		fmt.Println("  → 实现方案确定：IPv4 对端用库的 SocketDestroy，IPv6 对端用自建")
+		fmt.Println("     AF_INET6 请求。两者都已实测可断，无需外调 ss。")
 	case c3.ssKilled:
-		fmt.Println("  → IPv4 客户端可直接用库；真 IPv6 客户端内核支持但库拒绝，")
-		fmt.Println("     需要手写 AF_INET6 的 SOCK_DESTROY 请求才能覆盖。")
+		fmt.Println("  → 自建请求没生效但 ss -K 可以，说明请求拼装有误，需比对线格式。")
 	default:
-		fmt.Println("  → IPv4 客户端可用；真 IPv6 客户端两种方式都没断开，需单独调查。")
+		fmt.Println("  → IPv4 客户端可用；真 IPv6 客户端几种方式都没断开，需单独调查。")
 	}
+	fmt.Println("  （未触发的回退分支一律记为「失败」，不代表实测失败。）")
 }
 
 func yn(b bool) string {
@@ -201,6 +246,17 @@ func runCase(network, addr, dialNet, dialHost string) outcome {
 	fmt.Printf("  销毁后：服务端写入 err=%v\n", werr)
 
 	if !res.netlinkKilled {
+		verr := destroyV6(sl, sr)
+		fmt.Printf("  自建 AF_INET6 请求返回：%v\n", verr)
+		time.Sleep(300 * time.Millisecond)
+		gone6 := !present()
+		res.v6Killed = gone6
+		fmt.Printf("  自建请求后：套接字表中存在该四元组 = %v → %s\n", !gone6, state(gone6))
+		_, w6 := srv.Write(make([]byte, 4096))
+		fmt.Printf("  自建请求后：服务端写入 err=%v\n", w6)
+	}
+
+	if !res.netlinkKilled && !res.v6Killed {
 		filter := fmt.Sprintf("( sport = :%d and dport = :%d )", sl.Port, sr.Port)
 		out, _ := exec.Command("ss", "-K", "-tn", "state", "established", filter).CombinedOutput()
 		fmt.Printf("  回退试 ss -K %s\n%s", filter, indent(string(out)))
