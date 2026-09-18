@@ -899,6 +899,72 @@ read: software caused connection abort
 
 因此：机器 A 保持现状（生产、有真实用户、零暴露面，不值得为触发条件尚不存在的漏洞冒维护窗口风险）。**待机器 B 可用时在其上先验第三条路**——它无用户，且本来就要装面板、本来就要注册成节点，把该评估并入迁移，边际成本接近零。机器 B 长期不可用则重新评估。
 
+## 多节点架构、范围决定与现状核实（2026-09-18）
+
+### 用户确认的架构要求与两项范围决定
+
+用户 2026-09-18 给出的四点要求，作为多节点部分的验收口径：
+
+1. master 面板负责管理其它 Xray 节点；master 本机可以承载用户，也可以不承载。
+2. master 判定用户 A 流量用尽后通知所有节点，**所有节点断开用户 A 的全部连接**。
+3. master **定时**通知所有节点哪些用户仍有额度，有额度的用户在所有节点都能连接。
+4. 用户管理集中在 master。
+
+同日五项决定（前两项此前被当作可选项评估过，现已明确）：
+
+- **客户登录界面仍然需要**（设计文档第 3 条规则不变）。
+- **流量用尽必须立即断开已开连接**，不接受「新连接被拒、已开连接跑到自然结束」。这与设计文档 spec:77「新连接与已有连接都要服从额度规则」一致。
+- **master 向节点下发客户端停用时按用户操作，不再重推整个入站。** 节点只做 `AlterInbound` + `RemoveUserOperation`，同入站其他用户不受影响。基础设施现成：`Runtime` 接口的 `UpdateUser` / `DeleteUser` 就是为避免 `DelInbound + AddInbound` 而设，`Remote.UpdateUser` 经节点的 `panel/api/clients/update/:email` 落到节点本机的按用户 `RemoveUser`。要改的是让 `disableInvalidClients` 的节点远端计划改用它，而不是现在的 `rt.UpdateInbound`。这个决定把「整入站删建是否误伤同入站所有人」的风险从停用路径上根除，不必等实验结果。
+- **对账也改成按用户下发**（补法 (b)）。评审因改动量建议在节点侧接住整入站推送（补法 (a)），用户选 (b)：master 的 `ReconcileInbound` 拆成入站级与客户端级两层，客户端差异逐个按用户下发，比较基准从内存指纹改为节点快照，master 重启后也不再把每个入站整个重推一遍。
+- **保留状态推送：** master 定时把所有用户的状态推给所有节点。它由两部分组成，都是每 30 秒一次：已有的合计用量推送（节点据此自己判定谁没流量）；新增的启停收敛（与 (b) 共用同一函数，只推差异，效果等同全推一遍）。
+
+这两项的细节与评审更正见本节末链接的设计文档。
+
+### 拓扑与通道（读码确认）
+
+- **每台节点都是一套完整的 x-ui + Xray，且与 master 是同一个二进制。** 没有「master 模式 / 节点模式」开关（每个面板都注册心跳与 node-sync 定时任务，`web.go:355-357`）。角色由「谁登记了谁」决定：master 在库里存一条 `Node` 记录（`model.go:778-793`：Scheme / Address / Port / BasePath / ApiToken 或 mTLS），对方就成了它的节点。
+- **两段通道，不能混为一谈：**
+  - master → 节点：**HTTP REST**（token 或 mTLS），调的是**节点那台 x-ui 面板的 API**（`runtime/remote.go:228`），如 `panel/api/clients/*`、`panel/api/inbounds/*`。
+  - 节点 x-ui → 本机 Xray：**gRPC**，只听 `127.0.0.1:62789`（`internal/xray/api.go:95`）。外部连不到节点的 Xray API，所以 master 只能经由节点上的 x-ui。
+- **master 本机也总会拉起一个 Xray。** 本机配置跳过 `NodeID != nil` 的入站（`xray.go:201`），所以「独立面板服务器」拓扑下 master 的 Xray 只剩 api 入站、空转，不承载用户。
+- **部署影响：至少一台的面板要走出回环。** master 要调节点面板的 API，节点面板必须能被 master 访问。这与机器 A 当前「面板只绑 127.0.0.1」冲突，多节点部署时须改为只对 master 的 IP 开放并启用 mTLS 或 node-sync 作用域 token；每个节点都是完整面板，加固要逐台做。
+
+### 用量上行：master 定时拉取（已有）
+
+节点 Xray 计数 →（节点自己的流量任务，5 秒）→ 节点自己的 `client_traffics` →（master 每 5 秒拉节点的 `/panel/api/inbounds/list`）→ master 对每个 (节点, email) 存基线（`NodeClientTraffic`），以「新值 − 基线」为增量加到共享那一行并推进基线，**在一个事务内完成**，两节点增量正确相加。方向是**拉**不是推。
+
+`TestTwoNodesShareEmail_SumsCorrectly` 只覆盖汇总本身，**不覆盖 `total`、停用、`client_inbounds` 关联、大小写变体与失败路径**。
+
+**「流量账本丢增量」缺陷在每个节点上都存在**：节点的流量任务先推进内存基线再写库，写库失败则增量丢失，master 拉到的也少。它是额度判定的前提，必须在每个节点的代码里修。
+
+### 断流下行：v3.8.5 现有能力
+
+| 能力 | v3.8.5 |
+| --- | --- |
+| 挡住用户 A 的**新**连接（所有节点） | 有 |
+| 断开 A **已开**的连接且不影响别人 | **没有**，要新做 |
+| 断开节点上**所有人**（整核心重启） | 有，`restartRemoteNodesOnDisable`（`inbound_node.go:1379`），但见下 |
+
+**更正此前一处说法**：master 因额度耗尽停用节点上的用户时，走的**不是** `panel/api/clients/update/:email`，而是 `disableInvalidClients` 为节点入站构造远端计划后调 `rt.UpdateInbound`——**把整个入站重推给节点**，节点收到后执行**整个入站的 `DelInbound` + `AddInbound`**（过滤掉被停用者），节点自己的 `UpdateClientStat` 同时把本地 `enable` 置 false。结论不变（节点分不出「离开」、不杀 socket），但带出下面第 ① 条新风险。
+
+### 核实出的问题（都要进实施计划）
+
+1. **整入站删建对其他用户已开连接的影响从未实测。** 若删入站会断开它上面全部连接，则**现在每次有人耗尽，节点上同入站的所有人都会断线一次**。这决定了现状是否已在主动伤人。按上面的决定改完后，整入站推送只剩「管理员改入站本身」一种来源。
+2. **`restartXrayOnClientDisable` 在多节点下比此前记录更糟。** 一旦注册了节点，任何客户端被停用，master 都会**无条件重启自己的核心**（`node_traffic_sync_job.go:141-146`），**哪怕被停用者不在 master 上**；同时节点也被强制重启。默认配置下**任何一人耗尽 = 两台机器所有人断线**。且该节点重启调用是 **"Best-effort and never replayed"**（`inbound_node.go:1388`）——节点那一刻连不上，这次就永久丢失。必须在 master **和每个节点**上都关掉。
+3. **关掉开关后超用量实际上无上限。** REALITY + Vision + splice 下已开连接会一直跑，不是「很快自然结束」。这正是必须做定向断流的理由。
+4. **月度重置有竞态，可永久且静默地锁死用户。** v3.8.5 的顺序是先 `Update(Enable=true)`（`client_traffic.go:29-39`，单独事务提交，此时用量仍 ≥ 上限），再同步推节点（4 秒），**最后**才清零用量（`client_traffic.go:48-55`）。窗口内 5 秒一次的 `disableInvalidClients` 看到「已启用 + 用量 ≥ 上限」又把人停用，其后重置逻辑见其已停用而跳过；下个月他看起来像管理员手动停用，**永久锁死**。有节点时 `NodeTrafficSyncJob` 每轮无条件调 `AddTraffic(nil,nil)`，触发概率更高。另有三个毛病：客户端级 `trafficReset` **默认 `never`**；面板若在重置时刻未运行则**错过不补**；停用**没有原因字段**，全靠「用量 ≥ 上限」启发式区分耗尽与管理员停用。修法是在 `ResetTrafficByEmail` 里调序（先清零、后启用），见设计文档 4.6。
+5. `clientEmailsOwnedElsewhere` 的第一轮查询不过滤 `node_id`（`inbound_node.go:431-445`），挂在 master 本机入站上的 email 也算「别处」——拓扑 (a) 下节点上预先建好的同名客户端不会被链接。
+
+### 节点已能自行判定耗尽（节点侧断流的现成地基）
+
+master 每 **30 秒**（`nodeGlobalPushInterval`）经 `maybePushGlobals` → `Remote.PushGlobalClientTraffics`（`remote.go:799`）把**跨节点汇总后的用量**推给每个在线节点，节点经 `AcceptGlobalTraffic` 存入 `client_global_traffics`（按 email 字节精确匹配）。节点判定耗尽的 `depletedClientsCond`（`inbound_disable.go:45-53`）除本地用量外**还检查这份合计**，注释写明这是「让节点在本地份额没超、合计超了时也能切断客户端」。只认 `globalTrafficFreshWindow = 24h` 内刷新过的行。
+
+而节点自行判定耗尽后，走的是**它本机的 `inbound_traffic_apply.go:111`**——正是 S3 计划要改成 `DropUser` 的调用点。据此出了节点侧断流设计，见 [`superpowers/specs/2026-09-18-node-side-disconnect-design.md`](superpowers/specs/2026-09-18-node-side-disconnect-design.md)。
+
+### 加速：多节点实验不必等机器 B
+
+在本机 WSL 起第二个面板即可跑：不同 webPort 与数据库目录；第二个 Xray 的模板改开 api 端口 62789 与 metrics 端口 11111（`config.json:13,28`）；注册节点时打开 `AllowPrivateAddress`（回环地址默认被 `netsafe.go:33-35` 拦截）。能测节点失联收敛（S1 实验 3）、多节点传播、以及上面第 ① 条。唯一测不了的是 `SOCK_DESTROY`（WSL2 内核未开 `CONFIG_INET_DIAG_DESTROY`）。
+
 ## 下一阶段顺序
 
 1. ~~核实工作目录、分支及固定基线，阅读上述项目指导和安全证据~~ **已完成**。上游安全补丁的适用范围仍未核实。
