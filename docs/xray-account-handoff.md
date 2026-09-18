@@ -721,7 +721,7 @@ Shadowrocket 是闭源 iOS 客户端、TLS 栈自研（非 uTLS），其 `fp` �
 | --- | --- |
 | 在线 IP 表在连接存活期间不过期 | `app/stats/online_map.go` 为**引用计数**实现，`AddIP`/`RemoveIP` 在 `app/dispatcher/default.go:227-228` 由连接的 dispatch 与 `context.AfterFunc` 成对调用，无任何定时清理 |
 | 机器 A 内核支持销毁 socket | 实测 `CONFIG_INET_DIAG_DESTROY=y` |
-| Go 侧有现成 API，无需调外部命令 | `vishvananda/netlink` v1.3.1 已在 go.mod（间接依赖），`socket_linux.go:287` 有 `SocketDestroy(local, remote)` |
+| Go 侧有现成 API，无需调外部命令 | `vishvananda/netlink` v1.3.1 已在 go.mod（间接依赖），`socket_linux.go:287` 有 `SocketDestroy(local, remote)`。**仅对 IPv4 对端可用**，IPv6 需自己实现，见「netlink 库的地址族边界」 |
 | 面板有所需权限 | 加固后的 `CapEff` 仍含 bit 12 `CAP_NET_ADMIN`（drop-in 只剥掉了 `CAP_SYS_MODULE`） |
 | 两个核心版本都没有按用户断连的 API | 26.7.28 与 26.9.8 逐项对比 `app/proxyman/command`、`app/stats/command`、`proxy/vless/inbound` 等，无此能力；`UnregisterCounter` 全程无调用方 |
 
@@ -751,6 +751,21 @@ read: software caused connection abort
 
 另一个副产品比 S1 原结论更强：`RemoveUser` 后连接在 **Linux + REALITY + Vision + splice** 这个最不利场景下仍满速传输，而 S1 实验 2a 当初是在 Windows、无 REALITY/Vision 下做的。上游「没有单会话关闭 API」的说法至此在最强条件下被确认。
 
+### netlink 库的地址族边界（机器 A 实测，2026-09-18）
+
+`killprobe.sh` 用的是纯 IPv4 监听器 + `ss -K`，绕开了生产形态：生产的 443 是**双栈监听器**（`*:443`），IPv4 客户端的连接以 IPv4-mapped 形式落在 **AF_INET6** 套接字表里。为确认 Go 库能否直接处理，另写了 [`sockprobe`](superpowers/validation/testdata/s3-sockdestroy/sockprobe.go.txt) 三用例实测（只用自己的临时端口和自己的连接，未触碰 443、面板或任何生产配置；判据是「销毁后重新枚举四元组是否还在」，不是「还能否读到数据」——服务端持续写入时接收缓冲区的积压会让后者误判）：
+
+| 用例 | 枚举所在表 | `netlink.SocketDestroy` 返回 | 结果 |
+| --- | --- | --- | --- |
+| 纯 IPv4 监听器（对照组） | AF_INET | `<nil>` | 已销毁 |
+| 双栈监听器 + IPv4 客户端（**生产主流形态**） | AF_INET6 | `<nil>` | **已销毁** |
+| 双栈监听器 + 真 IPv6 客户端 | AF_INET6 | **`not implemented`** | **仍存活**（`ss -K` 能杀） |
+
+两条结论：
+
+1. **枚举的族 ≠ 销毁要用的族。** 库把请求的 `Family` 写死成 `AF_INET`（`socket_linux.go:270`）并不妨碍它销毁 AF_INET6 表里的 IPv4-mapped 套接字——内核的 TCP hashinfo 是共用的，v4 查找路径能命中。此前「双栈就必须手写 AF_INET6 请求」的推断是错的，对 IPv4 客户端不成立。
+2. **真 IPv6 客户端是库的硬缺口。** 库用 `To4() == nil` 拒绝非 v4 地址并返回 `not implemented`，而内核本身完全支持（`ss -K` 当场杀掉同一条连接）。**若只用现成库，IPv6 客户端永远断不掉**——这是静默的配额漏洞，不是可接受的边角：用户能否走 IPv6 由客户端侧决定，面板无从控制。实现须自己拼 AF_INET6 的 `SOCK_DESTROY` 请求（照抄库里那段，把 `Family` 与地址字段换成 v6），不能只靠库。
+
 ### 本次实验尚未覆盖的三点（实现阶段必须补）
 
 1. **email → 客户端 IP 的查询路径没被走到。** 本次是回环测试，而 `OnlineMap.AddIP` 刻意跳过 `127.0.0.1`/`[::1]`（`online_map.go:36`），所以在线表里查不到测试客户端。该路径由代码确认（引用计数），但需在真实远端客户端上实测一次。
@@ -761,6 +776,7 @@ read: software caused connection abort
 
 - **挂钩位置（2026-09-18 当日更正，原判断是错的）**：语义确实是「用户离开核心且不会被加回」，但**原先写的 `Local.UpdateUser` / `Local.DeleteUser` 这两个方法在生产路径上根本不会被执行**——经三方独立核查：`Manager.RuntimeFor`（`runtime/manager.go:72-77`）只在 `nodeID == nil` 时返回 `Local`，而 `rt.UpdateUser` / `rt.DeleteUser` / `rt.DeleteClient` 的全部 7 个调用点都位于 `oldInbound.NodeID != nil` 分支内，因此只会打到 `Remote`。master 通过 HTTP 到达节点（`Remote.UpdateUser` POST 到节点的 `/clients/update/:email`），节点侧落在自己的 `client_inbound_apply.go:1022` 本地分支。**结论：`Local.UpdateUser`/`Local.DeleteUser`/`Local.AddClient`/`Local.DeleteClient` 是测试之外的死代码，挂在那里一个人都断不掉。**
   真正的本地移除路径是 `rt.RemoveUser` 的 **6 个调用点**（均在 `NodeID == nil` 分支内，已由两个复核者独立 grep 确认为完整集合）：`inbound_traffic_apply.go:111`（**额度耗尽/到期，S3 要的就是这条**）、`client_bulk.go:1214`（批量删除）、`client_bulk.go:1812`（批量停用）、`client_inbound_apply.go:234`（解绑）、`:1217`（单个删除）、`:1022`（**修改客户端，之后可能在 `:1042` 加回，是唯一不能断的那个**）。**仍然不能挂在裸的 `RemoveUser` 上**——`UpdateUser` 每次修改客户端都是「先 `RemoveUser` 再 `AddUser`」（`runtime/local.go:305-315`），挂在那里会导致批量调整额度（第一版目标第 4 条）把这批人全部断线。此外批量删除、批量解绑直接调 `RemoveUser` 而不经 `DeleteUser`，实现时要把每条「离开且不回来」的路径都梳理到——这正是上游 `e790f467` 漏掉的那类问题。
+- **销毁 socket 要覆盖两个地址族**。`netlink.SocketDestroy` 只吃 IPv4 对端，真 IPv6 客户端会拿到 `not implemented` 且连接不断（实测见上节）。v1 就要把 AF_INET6 的请求自己拼出来，否则走 IPv6 的用户超额后照常畅通。
 - **需要新增「停用原因」字段**（要写数据库迁移）。`client_traffics` 目前只有一个 `enable` 布尔值，而已批准规则是「新周期只自动恢复因额度耗尽停用的账户，管理员手动停用的保持停用」，单个布尔值分不清这两者。设计文档里本就要求「区分管理员停用、额度耗尽和节点执行失败」。
 - **`AddUser` 失败的兜底要改成重试**。现有代码在 `AddUser` 失败时置 `needRestart`，30 秒后重启核心——这是整个周期里唯一还会重启的地方。
 - **必须同时修流量账本丢增量的缺陷**（见下节 L1/L2），否则「是否超额」的判定依据本身不准。
