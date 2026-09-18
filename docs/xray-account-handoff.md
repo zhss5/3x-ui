@@ -606,6 +606,8 @@ v3.7.0 ──92──▶ origin/main ──68──▶ v3.8.0 ──39──▶ 
 由此得到两条实测结论：
 
 1. **改客户端不会重启核心。** 改名与补 subId 都在 10:55:30 之后进行，其后日志**零重启记录**——热更成功。
+
+   **2026-09-18 版本限定（重要）：此结论只在 v3.7.0 上成立，不能直接搬到已合并 v3.8.5 的工作分支。** 实测时机器 A 跑的是 v3.7.0，其中 `restartXrayOnClientDisable` 虽默认 `true` 却一直空转（`xray.go` 里没有 `DropsUsers` / `restartToDropClients`）。v3.8.5 让该开关真正生效，而 `DropsUsers()`（`internal/xray/hot_diff.go:38`）判断「被移除的用户是否被重新加回」用的键是字节精确的 `u.Tag+"\x00"+u.Email`——**改名（哪怕只改大小写）会移除旧 email、加回新 email，于是被判为丢弃用户，在开关开启时触发整机重启、所有用户断线**。补 subId 不受影响：subId 不进 Xray 配置，diff 为空，根本不进入该判断。S3 开工清单第 3 项关掉这个开关后，`restartToDropClients` 首行即返回 `false`，此问题随之失效——所以**不改代码**，只在这里记下，并在「挂钩位置」一节补上它对 S3 的设计约束。
 2. **443 切换也没有重启核心。** 整个 2026-09-16 零重启记录，端口 44300 → 443 是**纯热更**完成的。这条比第 1 条更强，因为改端口的配置差异远大于改 email。
 
 **样本量必须诚实标注：n=2。** 机制本身是「热更失败才重启」，两次成功不等于永远成功。这把「理论上可能不断」提升为「实测两次未断」，不是证明。
@@ -793,6 +795,8 @@ read: software caused connection abort
 
 - **挂钩位置（2026-09-18 当日更正，原判断是错的）**：语义确实是「用户离开核心且不会被加回」，但**原先写的 `Local.UpdateUser` / `Local.DeleteUser` 这两个方法在生产路径上根本不会被执行**——经三方独立核查：`Manager.RuntimeFor`（`runtime/manager.go:72-77`）只在 `nodeID == nil` 时返回 `Local`，而 `rt.UpdateUser` / `rt.DeleteUser` / `rt.DeleteClient` 的全部 7 个调用点都位于 `oldInbound.NodeID != nil` 分支内，因此只会打到 `Remote`。master 通过 HTTP 到达节点（`Remote.UpdateUser` POST 到节点的 `/clients/update/:email`），节点侧落在自己的 `client_inbound_apply.go:1022` 本地分支。**结论：`Local.UpdateUser`/`Local.DeleteUser`/`Local.AddClient`/`Local.DeleteClient` 是测试之外的死代码，挂在那里一个人都断不掉。**
   真正的本地移除路径是 `rt.RemoveUser` 的 **6 个调用点**（均在 `NodeID == nil` 分支内，已由两个复核者独立 grep 确认为完整集合）：`inbound_traffic_apply.go:111`（**额度耗尽/到期，S3 要的就是这条**）、`client_bulk.go:1214`（批量删除）、`client_bulk.go:1812`（批量停用）、`client_inbound_apply.go:234`（解绑）、`:1217`（单个删除）、`:1022`（**修改客户端，之后可能在 `:1042` 加回，是唯一不能断的那个**）。**仍然不能挂在裸的 `RemoveUser` 上**——`UpdateUser` 每次修改客户端都是「先 `RemoveUser` 再 `AddUser`」（`runtime/local.go:305-315`），挂在那里会导致批量调整额度（第一版目标第 4 条）把这批人全部断线。此外批量删除、批量解绑直接调 `RemoveUser` 而不经 `DeleteUser`，实现时要把每条「离开且不回来」的路径都梳理到——这正是上游 `e790f467` 漏掉的那类问题。
+
+  **另一条陷阱：「离开且不回来」不能按 email 判断（2026-09-18 补充）。** 改名走的正是 `:1022` 这条修改路径，而且是「移除旧 email、加回新 email、UUID 不变」。若按 email 比对，旧 email 确实没被加回，改名的人就会被当成离开、socket 被杀掉。**上游的 `DropsUsers()`（`internal/xray/hot_diff.go:38-54`）恰好犯了这个错**：它用字节精确的 `u.Tag+"\x00"+u.Email` 作为「是否被重新加回」的键，于是把改名判成丢弃用户（详见「热更可靠性」一节的版本限定）。按本节的做法——在明确的「离开」调用点上逐个挂钩、排除 `:1022`——改名是安全的；若改成通用的「看 diff 里谁消失了」，就会重蹈 `DropsUsers()` 的覆辙。真要做通用判断，键应当是凭据（VLESS 的 UUID），不是 email。这与「客户端 email 大小写：完整风险面」一节是同一个根源：本项目里 email 同时充当身份键和可编辑的显示名。
 - **销毁 socket 要覆盖两个地址族**。按对端地址二选一：`To4() != nil` 用 `netlink.SocketDestroy`，否则用自建的 AF_INET6 请求；两条路径都已在机器 A 实测可断（见上节）。只用现成库的话，走 IPv6 的用户超额后照常畅通。
 - **需要新增「停用原因」字段**（要写数据库迁移）。`client_traffics` 目前只有一个 `enable` 布尔值，而已批准规则是「新周期只自动恢复因额度耗尽停用的账户，管理员手动停用的保持停用」，单个布尔值分不清这两者。设计文档里本就要求「区分管理员停用、额度耗尽和节点执行失败」。
 - **`AddUser` 失败的兜底要改成重试**。现有代码在 `AddUser` 失败时置 `needRestart`，30 秒后重启核心——这是整个周期里唯一还会重启的地方。
