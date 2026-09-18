@@ -1,154 +1,162 @@
 # 节点侧断流设计
 
-> 状态：**主线已定（用户，2026-09-18）；已并入一轮对抗评审的更正（三路对照 v3.8.5 源码）。待第 7 节实验后细化为实施计划。**
+> 状态：**主线已定：补法 (a)（用户，2026-09-18）。实验 1 已在本机 WSL 实测。经两轮对抗评审（对照 v3.8.5 源码与 Xray 26.7.28 源码）。待细化为实施计划。**
 > 前置：[S3 定向断连实现计划](../plans/2026-09-18-s3-targeted-disconnect.md)（本机 `DropUser`）。本设计复用它，不重复它。
 > 背景事实：handoff「多节点架构、范围决定与现状核实（2026-09-18）」一节。
 >
-> **用户已决定：**
-> 1. master 向节点下发客户端停用时**按用户操作**，不再重推整个入站。节点侧只做 `AlterInbound` + `RemoveUserOperation`，同入站其他用户不受影响。
-> 2. **对账也改成按用户下发**（讨论中的「补法 (b)」，而不是在节点侧接住整入站推送的补法 (a)）。
-> 3. **保留状态推送**：master 定时把所有用户的状态推给所有节点（第 4.1 节）。
+> **用户已决定（2026-09-18）：**
+> 1. **采用补法 (a)：节点在处理整入站更新时，自己算出谁不再被服务并断流。** master 的推送方式保持 v3.8.5 原样（额度停用仍是整入站推送），不新增按用户推送，不重构对账。
+> 2. **撤回同日早些时候「master 停用按用户下发」的决定。** 那个决定是为了避免整入站删建误伤同入站其他人；实验 1 证明删建不断开任何已开连接，理由不再成立。
+> 3. **断流时限：30 秒内可以接受。**
+> 4. **用量推送保持每 30 秒一次**，只作兜底。
 
 ## 1. 要解决的问题
 
-用户确认的要求：master 判定用户 A 用尽后，**所有节点断开 A 的全部连接**，且必须**立即断开已开连接**；master **定时**告知各节点谁仍可用。
+用户要求：master 判定用户 A 用尽后，**所有节点断开 A 的全部连接**，且必须**断开已开连接**（30 秒内）；同入站的其他人不受影响。
 
-S3 计划只做本机：把 `inbound_traffic_apply.go:111` 从 `RemoveUser` 改成 `DropUser`（`RemoveUser` + `SOCK_DESTROY`）。但 `SOCK_DESTROY` 只能销毁**它所在那台机器**内核里的 socket：用户连在远程节点上时 master 够不着，必须由节点自己执行；「独立面板服务器」拓扑下 master 本机不承载任何用户，**S3 本机断流一个人都断不掉**。所以只要要多节点、又要立即断，节点侧断流就必须进第一版。
+S3 计划只做本机：把 `inbound_traffic_apply.go:111` 从 `RemoveUser` 改成 `DropUser`（`RemoveUser` + `SOCK_DESTROY`）。`SOCK_DESTROY` 只能销毁**它所在那台机器**内核里的 socket：用户连在远程节点上时 master 够不着，必须由节点自己执行；「独立面板服务器」拓扑下 master 本机不承载任何用户，**S3 本机断流一个人都断不掉**。所以节点侧断流必须进第一版。
 
-**范围：Xray-core 协议**（VLESS / VMess / Trojan / Shadowsocks / Hysteria）。MTProto、AmneziaWG、TUIC 在 `inbound_traffic_apply.go:93-104` 就分流到各自的 `applyLocal*`，根本不经过 `:111`，S3 与本设计都不覆盖。
+**范围：Xray-core 协议**（VLESS / VMess / Trojan / Shadowsocks / Hysteria）。MTProto、AmneziaWG、TUIC 在 `inbound_traffic_apply.go:93-104` 分流到各自的 `applyLocal*`，节点 `UpdateInbound` 的 MTProto/TUIC 分支（`inbound.go:1898-1925`）也不调用 `DelInbound`，本设计不覆盖。
 
-## 2. 现状：谁先把 A 停掉，以及为什么不断流
+## 2. 实验 1：整入站更新不会断开任何已开连接（2026-09-18 实测）
 
-v3.8.5 里 A 在节点上被停用，先后**取决于 A 的流量是否分散在多个节点**：
+**方法。** 本机 WSL 开发面板，Xray 26.7.28 `5ca6f4b`（与机器 A 同版本）。建临时入站：VLESS + REALITY + Vision，两个用户 A、B。客户端是两个独立的 Xray 进程，各开一条 60 秒的慢速下载（每 0.5 秒一行带时间戳）。下载进行中，经面板 API 对该入站做两次整入站更新：第一次把 A 停用（等同 master 的额度停用推送），第二次只改备注（等同对账重推）。
 
-- **只在一个节点上用流量：** 该节点本地计数就是合计，且比 master 拉到的领先一个同步周期。节点本地判定通常先触发，**节点本机的 `:111` 会执行**——S3 在这里就能断流。
-- **分散在多个节点：** 每个节点的本地份额都没到额度，只有 master 的合计到了。master 在越过额度的那一轮先调 `AddTraffic` 停用并推送（`node_traffic_sync_job.go:137`），而那条推送是**整入站** `rt.UpdateInbound`：节点执行 `UpdateInbound` → `UpdateClientStat` 置 `enable=false` → `DelInbound + AddInbound`。节点下一轮只选 `enable = true` 的客户端（`inbound_disable.go:86`），**`:111` 永远不会为 A 执行**，A 的已开连接不会被杀。
+| 观察 | 结果 |
+| --- | --- |
+| 真的删建了入站 | 是：面板日志两次「Old inbound deleted / Updated inbound added」；监听 socket 的 inode 两次改变 |
+| Xray 是否重启 | 否，进程号不变 |
+| 更新后 Xray 里的用户 | 只剩 B |
+| 更新后 A / B 的**新**连接 | A 被拒，B 正常 |
+| **B 的已开下载**（同入站其他人） | **完好**：120/120 行，最长间隔 0.55 秒 |
+| **A 的已开下载**（被停用的人） | **也完好**：120/120 行，最长间隔 0.54 秒 |
 
-此外，master 的对账 `ReconcileNode`（`inbound_node.go:104`）逐入站调 `ReconcileInbound`（`remote.go:488`）：按内存里的指纹 `pushedFP` 判断是否变化，变了就**整入站**推送。`pushedFP` 只在内存里，**master 重启后为空，第一次对账会把每个入站整个重推一遍**。
+**源码印证**（评审逐行核对 Xray 26.7.28）：删入站只关监听 socket 和入站的处理对象（`app/proxyman/inbound/always.go:190-201`、`worker.go:151-166`、`transport/internet/tcp/hub.go:139-141`）；已接受的连接各自跑在独立协程里，上下文来自 Xray 启动时的 `context.Background()`（`worker.go:62`、`core/xray.go:168`），删入站时无人取消；REALITY 同样（`reality.go:53`）。VLESS 的 `Close` 不清空用户表（`proxy/vless/inbound/inbound.go:229-237`）。`AlterInbound` + `RemoveUserOperation` 只删用户表里的一项（`validator.go:47-58`），同样不断已开连接。
+
+**结论：**
+- 整入站删建**不误伤**同入站其他人。选 (a) 的前提成立。
+- 整入站删建**也不断开**被停用的人。Xray 自己从不断开已开连接，**每一条停用路径都必须由节点主动销毁 socket**。
+- 已开连接只会在两端关闭、出错或空闲超时时结束：默认空闲 300 秒，Vision splice 状态下 24 小时（`proxy/proxy.go:756-758`）。
+
+**实验的局限：** 回环网络；内层是明文 HTTP，Vision 没有进入 splice（splice 状态的连接与 Xray 的耦合更少，结论只会更成立）。每次删建之间有几毫秒没有监听，这期间的新连接被拒、未被接走的排队连接被重置（推断），客户端会自动重连。
+
+**实验中踩到的两个坑**（重做时注意）：WSL 的 `no_proxy` 含 `localhost`，curl 会绕过 SOCKS 直连，必须清掉代理变量；3x-ui 默认 freedom 出站的 `finalRules` 屏蔽私有地址，删掉该字段也仍按内置默认屏蔽，必须显式写成 `[{"action":"allow"}]`。脚本见本次会话 scratchpad `exp1/run.sh`，结束时恢复模板并删除临时入站。
 
 ## 3. 设计规则
 
 **节点上，一个凭据在某次更新前由 Xray 服务、更新后不再服务，就视为「离开且不回来」，立即断开它的连接。不论触发原因。**
 
-- **不按原因区分。** 已批准设计（spec:33、spec:61）要求管理员停用、到期也都要切断已开连接；S3 计划也把批量管理员停用接到了 `DropUser`。所以不需要「停用原因」字段——初稿要求「只有因额度停用才断流」，那会让被管理员停用的人继续连着，违反已批准设计，已删除。
-- **按凭据判断，不按 email、也不按 `ClientRecord`。** 凭据指 VLESS / VMess 的 `id`、Trojan / Shadowsocks 的 `password`、Hysteria 的 `auth`。不能用 email：改名是「移除旧 email、加回新 email、凭据不变」，按 email 会把改名当成离开——上游 `DropsUsers()`（`internal/xray/hot_diff.go:38-54`）就是这么错的。也不能用 `ClientRecord`：它按 email 建唯一索引（`model.go:919`），节点上一次改名会产生新行。
-- 由此：改名、改备注、调额度（凭据仍在服务）不断；停用、删除、解绑（凭据不再服务）都断。
+- **不按原因区分。** 已批准设计（spec:33、spec:61）要求管理员停用、到期也都要切断已开连接；S3 计划也把批量管理员停用接到了 `DropUser`。所以不需要「停用原因」字段。
+- **按凭据判断，不按 email、也不按 `ClientRecord`。** 凭据指 VLESS / VMess 的 `id`、Trojan / Shadowsocks 的 `password`、Hysteria 的 `auth`。改名是「移除旧 email、加回新 email、凭据不变」，按 email 会把改名当成离开——上游 `DropsUsers()`（`internal/xray/hot_diff.go:38-54`）就是这么错的。`ClientRecord` 按 email 建唯一索引（`model.go:919`），节点上一次改名会产生新行，也不能用。
+- 由此：改名、改备注、调额度不断；停用、删除、解绑、更换凭据都断。
 
 ## 4. 设计
 
-### 4.1 两种推送
+### 4.1 断流靠哪次推送触发：master 已有的整入站推送
 
-| | 内容 | 频率 | 作用 |
-| --- | --- | --- | --- |
-| **事件推送** | master 判定某用户停用 / 删除 / 恢复，立即按用户下发到其所在的每个节点 | 事件发生时 | **快**：约 10–12 秒内所有节点断开 |
-| **状态推送 ①：用量**（已有，保留不改） | 每个用户跨节点的合计用量（`maybePushGlobals` → `PushGlobalClientTraffics`，`remote.go:799`） | 每 30 秒 | 节点据此**自己判定**谁没流量：master 的事件丢了、或 master 宕机，节点照样能停 |
-| **状态推送 ②：启停收敛**（新增，即补法 b） | master 把自己库里每个用户的启停状态与节点实际状态对齐，差异按用户下发 | 每 30 秒，外加节点被标脏时 | **不漏**：丢失的事件、节点被本地改动、master 重启后，都在一个周期内纠正 |
+| 路径 | 内容 | 时效（从真正超额算起，按代码推算） |
+| --- | --- | --- |
+| **主路径**（v3.8.5 已有，不改） | master 每 5 秒拉一次节点用量；合计越过额度的那一轮，`AddTraffic`（`node_traffic_sync_job.go:137`）就停用该用户，并立即把**整个入站**推给每个承载它的节点（`inbound_disable.go:135-145` → `inbound_traffic.go:40` → `inbound_traffic_apply.go:71`，超时 4 秒） | 约 10–15 秒 |
+| **失败重试**（已有） | 推送失败时节点在同一事务里被标脏（`inbound_traffic.go:92`），下一轮 `ReconcileNode`（`node_traffic_sync_job.go:370-372`）再整入站推送；指纹只在成功后记录（`remote.go:462-469`），所以会一直重试 | 每 5 秒一次 |
+| **兜底**（已有，保持 30 秒） | 用量推送（`maybePushGlobals` → `PushGlobalClientTraffics`，`remote.go:799`），节点据合计自己判定，经 `:111` 停用 | 最坏约 40–46 秒；只在节点持续拒收入站更新、却仍接收用量推送时才起作用 |
 
-**状态推送 ② 只推差异，效果等同「把所有用户推一遍」。** master 每 5 秒经 `FetchTrafficSnapshot`（`remote.go:751`）拉取每个节点的 `panel/api/inbounds/list`，其中含完整的客户端列表与每人的启停状态，所以 master 随时知道节点的真实状态。逐人重推未变的用户，会让每个节点每 30 秒为每个用户做一次数据库写入和 Xray 的 `RemoveUser` + `AddUser`，并与单写者争用；只推差异，结果完全相同。
+主路径满足 30 秒要求。**不需要**新增按用户推送，也**不需要**把用量推送调快。
 
-`nodeGlobalPushInterval` 保持 30 秒：断流延迟来自事件推送，与推送间隔无关。
-
-### 4.2 对账改成按用户（补法 b）
-
-把 `ReconcileInbound` 拆成两层，比较基准从「内存指纹」改为「节点快照里的实际内容」：
-
-- **入站级字段**（除客户端列表外的一切：监听、端口、协议、`streamSettings`、REALITY、sniffing 等）与节点实际不同 → 整入站推送。这只在管理员改入站本身时发生，不可避免。
-- **只有客户端列表不同** → 逐个按用户下发：
-  - 节点上缺 → `Remote.AddClient`；
-  - 节点上多 → `Remote.DeleteUser`（节点落到 `client_inbound_apply.go:1217`，S3 已接 `DropUser`）；
-  - 两边都有但字段不同 → `Remote.UpdateUser`（节点落到 `:1021-1029`，见 4.3）。
-- **比较基准是节点快照**，所以 master 重启后不再触发整入站重推；内存指纹只保留为「未变则跳过」的快速路径。每次按用户推送成功后调现成的 `AdvancePushedInbound`（`remote.go:545`）。
-- **比较时用与整入站推送相同的构造**（`buildInboundForNodePush`，含 fallbacks），否则 fallbacks 这类构造差异会被误判为入站级变化。
-- **同一函数两处调用：** 节点被标脏时（现有，`node_traffic_sync_job.go:370`）；每 30 秒一次（状态推送 ②）。
-
-**方向约束（必须遵守，否则与现有逻辑打架）：**
-
-- **节点自己的真实停用不能被收敛「推回启用」。** 节点按与 master 相同的限额判定停用时，这个结论会锁存回 master（#4917，现有 `nodeDisableIsStale`，`inbound_node.go:253`）。收敛只在 master 的限额已变（重置、提额、延期）即节点的停用已过时，才向节点下发启用。
-- **刚推送过的用户这一轮不再比较。** 快照可能早于刚完成的推送（#6228，现有 `justPushed`），直接比较会重复推送。
-
-### 4.3 节点侧挂钩
+### 4.2 节点侧挂钩：所有停用落点都要断流
 
 | 来源 | 节点上的落点 | 挂钩 |
 | --- | --- | --- |
-| 节点自行判定（本地或合计超额） | `inbound_traffic_apply.go:111` | S3 已改为 `DropUser` |
-| master 按用户停用（事件推送或收敛） | `client_inbound_apply.go:1021-1029` | `if oldClients[clientIndex].Enable && !clients[0].Enable { DropUser } else { RemoveUser }` |
-| master 按用户删除 / 解绑 | `client_inbound_apply.go:1217` / `:234` | S3 已改为 `DropUser` |
-| master 整入站推送（仅入站级字段变化） | 节点 `InboundService.UpdateInbound` | 不挂钩，见 4.4 |
+| master 的整入站推送：额度（流量分散在多个节点的用户）、到期、对账重推、超过 32 人的批量操作、管理员改入站、入站开关 | 节点 `InboundService.UpdateInbound`（`inbound.go:1679`），`NodeID == nil` 分支 | **补法 (a)，本设计新增**，见 4.3 |
+| 节点自行判定（只在一个节点上用流量的人；兜底路径） | `inbound_traffic_apply.go:111` | S3 已改为 `DropUser` |
+| master 按用户推送的管理员停用：单个停用、Telegram 机器人开关、32 人以内的批量停用、更换凭据 | `client_inbound_apply.go:1021-1029` | **本设计新增一行判断**，见 4.4 |
+| master 按用户推送的删除 / 解绑（32 人以内） | `client_inbound_apply.go:1217` / `:234`；批量在 `client_bulk.go:1214`、`:1812` | S3 已改为 `DropUser` |
 
-- 第二行的判据来自同一条目（经 `oldEmail` 与 `clientIndex` 定位），改名安全；纯编辑（`enable` 不变）仍走 `RemoveUser`，S3 的 `TestEditPathStillUsesRemoveUserNotDropUser` 依然有意义。
-- **`DropUser` 应把 `RemoveUser` 的「找不到」当作继续销毁 socket**，而不是提前返回（S3 计划 532-535 行目前是返回）。用户可能已被别的路径移出 Xray，但连接还在。
-- **排除的挂钩位置：** `UpdateClientStat` 是按 email 的盲写 `UPDATE`，从不读旧的 `enable`，改名时整个被跳过；`hot_diff.go` 的 `RemovedUsers` 不带凭据、按 email 标识，且节点的 `UpdateInbound` 根本不经过它。
+**(a) 与 `:111` 两个都要。** 谁先停用，另一个就看不到变化：
+- 流量分散在多个节点时，master 的推送先到，节点的 `client_traffics.enable` 已被置 false，节点自己的检查只选 `enable = true` 的行（`inbound_disable.go:86`），**`:111` 永远不会执行**——只能靠 (a)。
+- 只在一个节点上用流量时，节点本地计数领先，节点先经 `:111` 停用并改写自己的设置（`inbound_disable.go:135`）；master 随后的推送在节点看来「更新前就已停用」，**(a) 的差集为空**——只能靠 `:111`。
 
-### 4.4 剩下的整入站推送
+### 4.3 补法 (a) 的实现要点
 
-按用户下发之后，整入站推送只剩「管理员改入站本身」一种来源。
+- **「更新前在服务」的集合必须在 `inbound.go:1768` 之前取。** `updateClientTraffics` 在那里就会改写 `enable` 并删除被移除客户端的行；`oldSnapshot`（`:1926`）复制时 Settings 已经是新的，不能当「更新前」。
+- **「在服务」按运行时的过滤规则算**（`inbound.go:2074-2079`）：settings 里 `enable` 为 true，并且 `client_traffics.enable` 不是 false。
+- **断流用旧 email 与旧快照**（旧 tag、旧端口）：在线表按旧 email 记录连接，socket 落在旧端口上。
+- **顺序必须是：先对旧 tag 调 `rt.RemoveUser` → 再销毁 socket → 最后 `DelInbound + AddInbound`。** 旧监听在删建之前还开着，它已接受但尚未解析完 VLESS 头的连接，会用旧的用户表认证通过（`hub.go:116-128`；`Close` 不清空用户表）；先移除用户，这些握手就会失败。
+- **风险：(a) 会把 master 与节点之间的任何差异都变成断连。** 例如 master 因 `clientEmailsOwnedElsewhere`（`inbound_node.go:1241-1261`）或墓碑记录过滤掉的客户端，一次整入站推送就会被真的踢下线。实施时要有测试确认 master 推出的客户端列表等于应服务的人。
 
-- 若同一次保存**也停用或删除了客户端**，master 先按用户下发这些离开，再推整入站——离开的人由 4.3 断流，不依赖整入站删建的副作用。
-- 整入站删建本身是否断开该入站**所有人**的已开连接，是实验 1。若是：改端口、换 REALITY 密钥本来就影响全部用户，可接受，但要在界面上说明。
+### 4.4 `:1021` 挂钩
 
-### 4.5 master 侧其它改动
+把 `client_inbound_apply.go:1021-1029` 的按用户移除改为：
 
-- **停用按用户下发（已决定）。** `disableInvalidClients` 为节点入站构造的远端计划（`inbound_disable.go:135-146` → `applyTrafficRemotePlans`，`inbound_traffic_apply.go:62-84`）从 `rt.UpdateInbound` 改为 `Remote.UpdateUser`，成功后调 `AdvancePushedInbound`。
-- **关闭 `restartXrayOnClientDisable`**（S3 计划 Task 7），在 master 与每个节点上都要关。
-- S3 计划的 Task 5「`Remote.DropUser` 告警桩」不再需要：master 对远程节点不直接下断流命令，而是下发状态变化，由节点断流。
+```
+if oldClients[clientIndex].Enable && (!clients[0].Enable || 凭据变了) { DropUser } else { RemoveUser }
+```
+
+- 判据来自同一条目（经 `oldEmail` 与 `clientIndex` 定位），改名安全；纯编辑仍走 `RemoveUser`，S3 的 `TestEditPathStillUsesRemoveUserNotDropUser` 依然有意义。
+- **今天这个缺口被默认配置掩盖了。** `restartXrayOnClientDisable` 默认开（`setting.go:172`），`:1026-1028` 会要求重启，`restartToDropClients`（`xray.go:1431-1442`）随后重启整个核心：被停用的人确实断了，但节点上所有人一起断。S3 Task 7 关掉开关后，这个缺口就露出来了。
+
+### 4.5 其它改动
+
+- **`DropUser` 应把 `RemoveUser` 的「找不到」当作继续销毁 socket**，而不是提前返回（S3 计划 532-535 行目前是返回）。
+- **`restartXrayOnClientDisable` 必须在 master 和每个节点上都关掉。** 开着时 master 会强制重启节点的整个 Xray（`inbound_traffic.go:41-43` → `inbound_node.go:1379-1405`），节点也会自己重启（`xray_traffic_job.go:90-100`），所有人断线。**S3 Task 7 只改新数据库的默认值，已有面板数据库里存的旧值不变，要逐台显式关掉。**
+- master 的推送方式、`ReconcileNode`、`nodeGlobalPushInterval` 都不改。S3 计划的 Task 5「`Remote.DropUser` 告警桩」不再需要。
 
 ### 4.6 恢复（月度重置 / 提额）
 
-- **在 `ResetTrafficByEmail`（`client_traffic.go:15-56`）里调换顺序：** 先逐入站清零，再 `Update(Enable=true)`，作为**两次先后执行的串行写入**。不能嵌套进同一个写入序列：`ClientService.Update → UpdateInboundClient → runSerializedTx` 嵌在 `submitTrafficWrite` 里会让单写者死锁。这个函数经 `clients/resetTraffic` 在节点上也会执行，一处改动同时修好 master 与节点。
+- **在 `ResetTrafficByEmail`（`client_traffic.go:15-56`）里调换顺序：** 先逐入站清零，再 `Update(Enable=true)`，作为**两次先后执行的串行写入**。不能嵌进同一个写入序列：`ClientService.Update → UpdateInboundClient → runSerializedTx` 嵌在 `submitTrafficWrite` 里会让单写者死锁。这个函数经 `clients/resetTraffic` 在节点上也会执行，一处改动同时修好 master 与节点。
 - **第一版必须用客户端级周期**（`resetClientsOnTheirOwnCycle → ResetTrafficByEmail`）。入站级周期不会恢复因额度被停用的客户端。
 - **残留情形一：** 清零之后 `Update` 若失败，客户端停留在「停用且用量 0」，会被读作管理员停用。要大声记日志。
-- **残留情形二（状态收敛要处理）：** 重置向某个节点的传播失败时，该节点本地计数仍高：收敛推去的启用会被节点立刻再次停用，而且因限额未变，这个停用会按 #4917 锁存回 master，用户被锁死。所以**重置也要纳入收敛**：master 发现节点上某用户的本地计数与自己的重置不一致时，重发 `ResetClientTraffic`，再下发启用。判据在实施计划里定，实验 5 覆盖。
+- **残留情形二（已知缺口，实施计划处理）：** 重置向某个节点的传播失败时，该节点本地计数仍高：master 推去的启用会被节点立刻再次停用，而且因限额未变，这个停用会按 #4917 锁存回 master，用户被锁死。
 
 ### 4.7 与账户层的关系
 
-按已批准设计，额度属于**账户**，一个账户可有多个 `ClientRecord`。账户层落地后：账户耗尽 → master 对其名下所有凭据、在所有节点上按用户下发停用。节点侧规则（第 3 节）不变，仍按凭据执行。
+按已批准设计，额度属于**账户**，一个账户可有多个 `ClientRecord`。账户层落地后：账户耗尽 → master 停用其名下所有凭据 → 经上面同样的推送与挂钩在所有节点断流。节点侧规则（第 3 节）不变。
 
-## 5. 补法 (a) 与 (b) 的取舍
+## 5. 为什么选 (a) 而不是 (b)
 
-| | (a) 节点侧接住整入站推送 | (b) 对账改成按用户（采用） |
+| | (a) 节点接住整入站推送（采用） | (b) 对账改成按用户 |
 | --- | --- | --- |
-| 改动位置 | 节点 `UpdateInbound`：事务内算出「不再服务」的凭据，在 `DelInbound` 之前断流 | master `ReconcileInbound`：拆成入站级与客户端级两层 |
-| 同入站其他人 | 仍经历整入站删建（是否受影响取决于实验 1） | 不受影响 |
-| master 重启后 | 每个入站仍被整个重推一次 | 按节点快照比较，不再整个重推 |
-| 改动量 | 小 | 大：一次重构 |
+| 同入站其他人 | 不受影响（实验 1） | 不受影响 |
+| 30 秒时限 | 满足（约 10–15 秒） | 满足 |
+| master 端改动 | 基本不改，只关重启开关 | 重构 `ReconcileInbound` 为两层，新增启停收敛 |
+| 节点端挂钩 | (a) + `:111` + `:1021` + `:1217` | `:111` + `:1021` + `:1217`（省掉 (a)） |
+| 每次停用的副作用 | 该入站有几毫秒不接受新连接，客户端自动重连 | 无 |
 
-评审曾因改动量建议 (a)。用户选择 (b)：它从根上消除「为停用某一人而删建整个入站」，与「按用户外科手术式」一致，也顺带满足「定时把所有用户状态推一遍」。
+两者都满足需求，(a) 改动小得多，符合 CLAUDE.md「改动幅度匹配问题幅度」。**会让结论翻转的情况：** 今后若发现整入站删建会断开已开连接（例如换了 Xray 版本或内层进入 splice 后表现不同），(b) 就又是必需的。
 
-## 6. 限制与遗留（不在本设计内解决）
+## 6. 限制与遗留
 
+- **删除整个入站不断流。** 管理员删入站、`ReconcileNode` 清理多余标签（`inbound_node.go:199`）、节点因入站自身额度或到期删入站（`inbound_disable.go:14-33` → `inbound_traffic_apply.go:116`）：里面的已开连接会继续跑到空闲超时。没有任何挂钩接住，见第 8 节。
+- **Vision splice 期间的下行流量要等 splice 结束才计入**（`proxy/proxy.go:760-769`）：一条长时间 splice 的下载在结束之前对额度检测不可见，与推送设计无关（S1 实验文档已记录）。
 - **按 IP 杀，同出口 IP 连带**：决定 ③ 不变；每次销毁前检测同 IP 多 email 并记日志（必做项）。
-- **秒级延迟，非字节级硬上限**：约 10–12 秒，设计文档本已写明不承诺字节级上限。
-- **master 宕机期间：** 冻结的 `client_global_traffics` 只拦得住**宕机那一刻已经超额**的用户；其他人从第一秒起就只受各节点本地计数约束，每个账户最坏可超用 **(N−1) 份额度**，两节点即多用一整份。24 小时新鲜度窗口不改变这一点（初稿「节点按最后合计继续执行 24 小时」的说法有误）。
-- **每个节点必须**：跑本 fork；内核开 `CONFIG_INET_DIAG_DESTROY`；面板进程有 `CAP_NET_ADMIN`。机器 A 实测满足，其它节点逐台核实。
-- **全局用量按 email 字节精确匹配**：email 大小写风险面（handoff 同名一节）在此同样成立，依赖「全小写不透明 handle」约定。
+- **master 宕机期间：** 冻结的 `client_global_traffics` 只拦得住宕机那一刻已经超额的用户；其他人从第一秒起只受各节点本地计数约束，每个账户最坏可超用 **(N−1) 份额度**，两节点即多用一整份。
+- **每个节点必须**：跑本 fork；内核开 `CONFIG_INET_DIAG_DESTROY`；面板进程有 `CAP_NET_ADMIN`；`restartXrayOnClientDisable` 已关。
+- **全局用量按 email 字节精确匹配**：依赖「全小写不透明 handle」约定。
 - **MTProto / AmneziaWG / TUIC 不在范围内**（见第 1 节）。
 
-## 7. 前置实验
+## 7. 其余实验
 
-实验 1–5 可在本机 WSL 起两个面板完成（方法见 handoff「加速」一段）；只有实验 6 需要真实 Linux 节点。
+均可在本机 WSL 起两个面板完成，只有第 5 项需要真实 Linux 节点（WSL2 内核未开 `CONFIG_INET_DIAG_DESTROY`）。
 
-1. **整入站 `DelInbound + AddInbound` 对同入站其他用户已开连接的影响。** 决定 4.4 要不要在界面上提示；也决定机器 A 当前的 v3.7.0（仍用整入站推送停用）是否正在误伤。
-2. **谁先停用：** 流量分散于两节点的用户（预期 master 先到）与只在单节点上的用户（预期节点 `:111` 先执行）各测一次。
-3. **按用户停用 → 节点 `:1021-1029` 挂钩 → `DropUser`**（不含 `SOCK_DESTROY`；验证改名、调额度不误伤）。
-4. **按用户对账：** 下发时让节点不可达，恢复后收敛按用户补发；重启 master 后确认不再整入站重推；在节点上手工改一个用户的启停，确认 30 秒内被纠正。
-5. **重置：** 调序后不再被重新停用；重置向节点的传播失败时，收敛能否补上而不锁死用户。
-6. **在真实远程节点上 `SOCK_DESTROY`**：需要第二台真实 Linux 机器，或临时把机器 A 注册为某个 master 的节点。
+1. **谁先停用：** 流量分散于两节点的用户（预期 master 先推、节点走 (a)）与只在单节点上的用户（预期节点先走 `:111`）各测一次。
+2. **(a) 与 `:1021` 的挂钩选人**（不含 `SOCK_DESTROY`）：只选中不再服务的凭据；改名、调额度不误选。
+3. **对账路径：** 按停用推送时让节点不可达，恢复后 `ReconcileNode` 整入站重推，确认 (a) 接住。
+4. **重置：** 调序后不再被重新停用；重置向节点的传播失败时的表现（4.6 残留情形二）。
+5. **在真实远程节点上 `SOCK_DESTROY`**：需要第二台真实 Linux 机器，或临时把机器 A 注册为某个 master 的节点。
 
-## 8. 还需用户决定的一项
+## 8. 还需用户决定的两项
 
-**master 宕机期间的超用：** 宕机期间每个账户最坏可多用 (N−1) 份额度（两节点即一整份），可以接受吗？若不能接受，需要为「master 失联」另行设计机制（代码里没有现成的）。
+1. **master 宕机期间的超用：** 每个账户最坏可多用 (N−1) 份额度（两节点即一整份），可以接受吗？不能接受则需为「master 失联」另行设计机制（代码里没有现成的）。
+2. **删除整个入站时要不要断流：** 目前里面的已开连接会继续跑到空闲超时（最长 24 小时）。要断，就在节点删入站的路径上也加同样的挂钩（按旧快照断开该入站的全部凭据）。
 
 ## 9. 相对 S3 计划新增的工作
 
-S3 计划本身**原样复用**（它在每个节点上都生效），去掉其 Task 5。新增：
+S3 计划**原样复用**（它在每个节点上都生效），去掉其 Task 5。新增：
 
-1. 节点 `client_inbound_apply.go:1021-1029`：`enable` 由 true 变 false 时 `DropUser`，否则 `RemoveUser`。
-2. `DropUser` 对「`RemoveUser` 找不到」的容忍。
-3. master `disableInvalidClients` 的节点远端计划改为 `Remote.UpdateUser`，成功后 `AdvancePushedInbound`。
-4. master `ReconcileInbound` 拆成两层，按节点快照比较，客户端差异按用户下发（4.2），含两条方向约束。
-5. 每 30 秒的启停收敛（状态推送 ②），与标脏对账共用第 4 项。
-6. 管理员改入站时，先按用户下发离开，再推整入站（4.4）。
-7. `ResetTrafficByEmail` 调序；重置纳入收敛（4.6）。
-8. 以上各项的测试，以及第 7 节的实验记录。
+1. 节点 `InboundService.UpdateInbound` 的补法 (a) 挂钩（4.3）。
+2. 节点 `client_inbound_apply.go:1021-1029` 的判断（4.4）。
+3. `DropUser` 对「`RemoveUser` 找不到」的容忍。
+4. `ResetTrafficByEmail` 调序（4.6）。
+5. 部署清单：每个面板显式关闭 `restartXrayOnClientDisable`。
+6. 以上各项的测试，以及第 7 节的实验记录。
 
-**初稿中已删除：** 停用原因字段及其迁移、`nodeGlobalPushInterval` 调快、重置后立即补推、节点侧恢复对账。
+**不做：** 按用户的停用推送、对账重构、启停收敛、停用原因字段、推送间隔调快、重置后补推、节点侧恢复对账。

@@ -901,7 +901,7 @@ read: software caused connection abort
 
 ## 多节点架构、范围决定与现状核实（2026-09-18）
 
-### 用户确认的架构要求与两项范围决定
+### 用户确认的架构要求与范围决定
 
 用户 2026-09-18 给出的四点要求，作为多节点部分的验收口径：
 
@@ -910,15 +910,14 @@ read: software caused connection abort
 3. master **定时**通知所有节点哪些用户仍有额度，有额度的用户在所有节点都能连接。
 4. 用户管理集中在 master。
 
-同日五项决定（前两项此前被当作可选项评估过，现已明确）：
+同日决定（前两项此前被当作可选项评估过，现已明确）：
 
 - **客户登录界面仍然需要**（设计文档第 3 条规则不变）。
-- **流量用尽必须立即断开已开连接**，不接受「新连接被拒、已开连接跑到自然结束」。这与设计文档 spec:77「新连接与已有连接都要服从额度规则」一致。
-- **master 向节点下发客户端停用时按用户操作，不再重推整个入站。** 节点只做 `AlterInbound` + `RemoveUserOperation`，同入站其他用户不受影响。基础设施现成：`Runtime` 接口的 `UpdateUser` / `DeleteUser` 就是为避免 `DelInbound + AddInbound` 而设，`Remote.UpdateUser` 经节点的 `panel/api/clients/update/:email` 落到节点本机的按用户 `RemoveUser`。要改的是让 `disableInvalidClients` 的节点远端计划改用它，而不是现在的 `rt.UpdateInbound`。这个决定把「整入站删建是否误伤同入站所有人」的风险从停用路径上根除，不必等实验结果。
-- **对账也改成按用户下发**（补法 (b)）。评审因改动量建议在节点侧接住整入站推送（补法 (a)），用户选 (b)：master 的 `ReconcileInbound` 拆成入站级与客户端级两层，客户端差异逐个按用户下发，比较基准从内存指纹改为节点快照，master 重启后也不再把每个入站整个重推一遍。
-- **保留状态推送：** master 定时把所有用户的状态推给所有节点。它由两部分组成，都是每 30 秒一次：已有的合计用量推送（节点据此自己判定谁没流量）；新增的启停收敛（与 (b) 共用同一函数，只推差异，效果等同全推一遍）。
+- **流量用尽必须断开已开连接**，不接受「新连接被拒、已开连接跑到自然结束」。这与设计文档 spec:77「新连接与已有连接都要服从额度规则」一致。**时限：30 秒内可以接受。**
+- **节点侧断流采用补法 (a)。** master 的推送方式保持 v3.8.5 原样：额度停用仍把整个入站推给节点。节点在处理整入站更新时，自己算出谁不再被服务并断流。不新增按用户推送，不重构对账，用量推送保持每 30 秒一次，只作兜底。
+- **撤回的决定。** 同日早些时候曾决定「master 停用按用户下发」，随后又选了「对账也按用户下发（补法 (b)）+ 新增启停收敛」（提交 `b2e7c2c0`）。它们都是为了避免整入站删建误伤同入站其他人。实验 1 实测删建不断开任何已开连接（下面第 ① 条），这些改动失去理由，全部撤回。
 
-这两项的细节与评审更正见本节末链接的设计文档。
+细节、实验记录与评审更正见本节末链接的设计文档。
 
 ### 拓扑与通道（读码确认）
 
@@ -949,8 +948,12 @@ read: software caused connection abort
 
 ### 核实出的问题（都要进实施计划）
 
-1. **整入站删建对其他用户已开连接的影响从未实测。** 若删入站会断开它上面全部连接，则**现在每次有人耗尽，节点上同入站的所有人都会断线一次**。这决定了现状是否已在主动伤人。按上面的决定改完后，整入站推送只剩「管理员改入站本身」一种来源。
-2. **`restartXrayOnClientDisable` 在多节点下比此前记录更糟。** 一旦注册了节点，任何客户端被停用，master 都会**无条件重启自己的核心**（`node_traffic_sync_job.go:141-146`），**哪怕被停用者不在 master 上**；同时节点也被强制重启。默认配置下**任何一人耗尽 = 两台机器所有人断线**。且该节点重启调用是 **"Best-effort and never replayed"**（`inbound_node.go:1388`）——节点那一刻连不上，这次就永久丢失。必须在 master **和每个节点**上都关掉。
+1. **整入站删建对已开连接的影响：已实测，不影响任何人**（2026-09-18，本机 WSL 开发面板，Xray 26.7.28，VLESS + REALITY + Vision）。两次整入站更新都真的删建了入站：监听 socket 的 inode 改变，Xray 未重启。结果：
+   - 同入站另一用户的慢速下载完整跑完：120/120 行，最长间隔 0.55 秒；
+   - 被停用用户的下载也完整跑完；
+   - 被停用用户的新连接被拒。
+   所以现状没有在误伤别人，但被停用的人也断不掉。Xray 源码逐行印证了这一点。详见设计文档第 2 节。
+2. **`restartXrayOnClientDisable` 在多节点下比此前记录更糟。** 一旦注册了节点，任何客户端被停用，master 都会**无条件重启自己的核心**（`node_traffic_sync_job.go:141-146`），**哪怕被停用者不在 master 上**；同时节点也被强制重启。默认配置下**任何一人耗尽 = 两台机器所有人断线**。且该节点重启调用是 **"Best-effort and never replayed"**（`inbound_node.go:1388`）——节点那一刻连不上，这次就永久丢失。必须在 master **和每个节点**上都关掉。S3 Task 7 只改新数据库的默认值，已有面板数据库里存的旧值不变，**要逐台显式关掉**。
 3. **关掉开关后超用量实际上无上限。** REALITY + Vision + splice 下已开连接会一直跑，不是「很快自然结束」。这正是必须做定向断流的理由。
 4. **月度重置有竞态，可永久且静默地锁死用户。** v3.8.5 的顺序是先 `Update(Enable=true)`（`client_traffic.go:29-39`，单独事务提交，此时用量仍 ≥ 上限），再同步推节点（4 秒），**最后**才清零用量（`client_traffic.go:48-55`）。窗口内 5 秒一次的 `disableInvalidClients` 看到「已启用 + 用量 ≥ 上限」又把人停用，其后重置逻辑见其已停用而跳过；下个月他看起来像管理员手动停用，**永久锁死**。有节点时 `NodeTrafficSyncJob` 每轮无条件调 `AddTraffic(nil,nil)`，触发概率更高。另有三个毛病：客户端级 `trafficReset` **默认 `never`**；面板若在重置时刻未运行则**错过不补**；停用**没有原因字段**，全靠「用量 ≥ 上限」启发式区分耗尽与管理员停用。修法是在 `ResetTrafficByEmail` 里调序（先清零、后启用），见设计文档 4.6。
 5. `clientEmailsOwnedElsewhere` 的第一轮查询不过滤 `node_id`（`inbound_node.go:431-445`），挂在 master 本机入站上的 email 也算「别处」——拓扑 (a) 下节点上预先建好的同名客户端不会被链接。
@@ -959,11 +962,11 @@ read: software caused connection abort
 
 master 每 **30 秒**（`nodeGlobalPushInterval`）经 `maybePushGlobals` → `Remote.PushGlobalClientTraffics`（`remote.go:799`）把**跨节点汇总后的用量**推给每个在线节点，节点经 `AcceptGlobalTraffic` 存入 `client_global_traffics`（按 email 字节精确匹配）。节点判定耗尽的 `depletedClientsCond`（`inbound_disable.go:45-53`）除本地用量外**还检查这份合计**，注释写明这是「让节点在本地份额没超、合计超了时也能切断客户端」。只认 `globalTrafficFreshWindow = 24h` 内刷新过的行。
 
-而节点自行判定耗尽后，走的是**它本机的 `inbound_traffic_apply.go:111`**——正是 S3 计划要改成 `DropUser` 的调用点。据此出了节点侧断流设计，见 [`superpowers/specs/2026-09-18-node-side-disconnect-design.md`](superpowers/specs/2026-09-18-node-side-disconnect-design.md)。
+而节点自行判定耗尽后，走的是**它本机的 `inbound_traffic_apply.go:111`**——正是 S3 计划要改成 `DropUser` 的调用点。但流量分散在多个节点时，master 的整入站推送总是先到，节点的 `:111` 不会执行，所以节点还必须在处理整入站更新时断流（补法 (a)）。设计见 [`superpowers/specs/2026-09-18-node-side-disconnect-design.md`](superpowers/specs/2026-09-18-node-side-disconnect-design.md)。
 
 ### 加速：多节点实验不必等机器 B
 
-在本机 WSL 起第二个面板即可跑：不同 webPort 与数据库目录；第二个 Xray 的模板改开 api 端口 62789 与 metrics 端口 11111（`config.json:13,28`）；注册节点时打开 `AllowPrivateAddress`（回环地址默认被 `netsafe.go:33-35` 拦截）。能测节点失联收敛（S1 实验 3）、多节点传播、以及上面第 ① 条。唯一测不了的是 `SOCK_DESTROY`（WSL2 内核未开 `CONFIG_INET_DIAG_DESTROY`）。
+在本机 WSL 起第二个面板即可跑：不同 webPort 与数据库目录；第二个 Xray 的模板改开 api 端口 62789 与 metrics 端口 11111（`config.json:13,28`）；注册节点时打开 `AllowPrivateAddress`（回环地址默认被 `netsafe.go:33-35` 拦截）。能测节点失联收敛（S1 实验 3）与多节点传播。上面第 ① 条只需一个面板，已做完。唯一测不了的是 `SOCK_DESTROY`（WSL2 内核未开 `CONFIG_INET_DIAG_DESTROY`）。
 
 ## 下一阶段顺序
 
