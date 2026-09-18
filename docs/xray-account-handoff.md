@@ -828,13 +828,44 @@ read: software caused connection abort
 
 `v3.7.0` / `v3.8.5` 是**面板**版本，`26.7.28` / `26.9.9` 是**核心**版本，两条线独立。上游 v3.8.5 发行版配套的核心是 26.9.9，本项目刻意不用——26.9.x 的 X25519MLKEM768 门槛不可配置，会切断 Shadowrocket，而 Shadowrocket 占实际客户端的一半。因此走的是「新面板 + 钉住老核心」这一**非标准组合**，上游没有为它做过验证。`go build .` 只产出面板二进制、不含核心，所以「只编译 x-ui」这个理解是对的。
 
-### 待用户拍板的问题
+### 审计结果（2026-09-18，5 维度并行 + 逐条对抗性复核，49 个 agent）
 
-1. **是否先部署纯净的 v3.8.5，再上断连功能？** 倾向是「先部署」——把「新面板能否驱动老核心」与「断连机制对不对」两个独立风险拆开，一次只改一件事，坏了能定位。
-2. **但纯净部署可能自带一个新风险。** 上游 v3.8.5 的 `restartXrayOnClientDisable` 默认 `"true"`，而机器 A 的库是 v3.7.0 建的、没有这一行，读出来即默认值。若确为 true，则部署本身就引入了 v3.7.0 上不存在的全员断线路径：任一用户流量到额度，全机器一起掉线。若属实，首次部署就应带上计划 Task 7 那一行（默认改 `false`），它与断连功能无关、不碰任何逻辑路径。
-3. **回退是否只换二进制就够。** v3.7.0 → v3.8.5 首次启动会对既有 `/etc/x-ui/x-ui.db` 跑迁移。若迁移不可逆，回退必须连库一起还原，备份策略要相应加强。
+**没有 blocker。** 38 条结论有裁决，23 条站住、15 条被反驳。按维度：behavior-drift 7/11、core-binary-mgmt 5/7、core-compat 3/8、disable-restart 6/8、db-migration 2/4。
 
-第 2、3 点及「配置生成会不会吐出 26.7.28 解析不了的字段」已交由一次并行审计核查，**结论尚未产出，落定后补写本节**。在此之前不要动生产。
+#### 一、最要紧的一条，并更正一处此前的错误说法
+
+此前在本项目内说过「上游 v3.8.5 **新引入**了 `restartXrayOnClientDisable`，默认 true，部署即引入新的全员断线风险」。**这句话的理由是错的，结论是对的**，必须分清：
+
+- **设置不是新的。** `restartXrayOnClientDisable` 在 v3.7.0（`setting.go:130`）与 HEAD（`setting.go:172`）默认**都是 `"true"`**，机器 A 今天这个开关就是「开」的。
+- **但它在 v3.7.0 上一直空转。** `git show v3.7.0:internal/web/service/xray.go` 里 `DropsUsers` / `restartToDropClients` 出现 **0 次**——自动停用虽然调了 `RestartXray(false)`，却被 `tryHotApply` 短路成一次 gRPC `RemoveUser`，进程不动，被停用客户端的会话继续跑流量。这正是上游 `e790f467` 要修的 bug。
+- **HEAD 让它真正生效。** 新增 `restartToDropClients`（`xray.go:1433`，闸门是 `diff.DropsUsers()`），在 `tryHotApply` 内 `xray.go:1464` 返回 false，于是走到 `process.Stop()` + 重新 exec。
+
+**所以：换二进制确实会把一个今天空转的开关变成真实的整核心重启，「任一客户端跑满额度或到期 = 全员断线一次」。** 触发者包括无人值守的 5 秒流量作业（`xray_traffic_job.go:90-99`），不是只有管理员手动操作。重启无排空：SIGTERM → 最多 5s → Kill → 最多 2s → 重新 exec，`*:443` 上所有会话随进程消失。
+
+审计内部对这一条有过分歧：有一条结论主张「机器 A 今天已是此行为、不算部署增量」，理由是 `xray_traffic_job.go` 两版逐字节相同。**该理由不成立**——调用点相同不等于效果相同，差异在下游的 `tryHotApply`。已用上面三条命令独立核实，以「是新增行为」为准。
+
+#### 二、因此的部署方式：先关开关，让部署变成行为中性
+
+推荐顺序，关键是**第 1 步在换二进制之前做**：
+
+1. 在**当前 v3.7.0 面板**上把「客户端禁用时重启 Xray」关掉，确认 `settings` 表该行 `value='false'`。此举在 v3.7.0 上无任何行为变化（本就空转），但会让新二进制读到 false。
+2. 备份二进制与数据库。
+3. 部署自建面板（并带上计划 Task 7 的默认值改 `false`，作为双保险，覆盖「库里没有这一行」的情形）。
+4. 验证：`is-active`、核心仍为 26.7.28、所有人能重连。
+
+这样部署后机器 A 的行为与今天**完全一致**：超额客户端被挡住新握手、旧连接不被切断。而「旧连接不被切断」正是 S3 要解决的问题，由 `DropUser` 用定向销毁替代整核心重启来解决——不是靠这个开关。
+
+#### 三、其余站住的结论（均非阻塞）
+
+- **核心兼容性未发现问题。** 面板走 gRPC 的服务包（`app/proxyman/command`、`app/stats/command`、`app/router/command`）与账号类型包在 26.7.28 与 26.9.9 之间逐字节相同；面板启动路径**没有任何核心版本检查或最低版本门槛**，仍是 `exec.CommandContext(GetBinaryPath(), "-c", configPath)`（`process.go:625`）。
+- **不会偷换核心二进制。** 启动路径与全部 19 个 cron job 都不下载或替换 `bin/` 下的核心；唯一能覆盖它的是手动 `POST /panel/api/server/installXray/:version`（`controller/server.go:70`）。`systemctl restart x-ui` 不触发任何安装脚本。**运维纪律：部署后不要点面板里的「更新 Xray 核心」。**
+- **一个操作禁忌。** 本分支前端 `outbound-link-parser.ts:383-393` 在解析带 `mport=` 的 hysteria2 出站链接时会合成 `{type:'udphop'}`，而 26.7.28 的 `udpmaskLoader` 不认识该 id，`infra/conf/loader.go:23-29` 报 `unknown config id: udphop` 并退出 → 443 整条断，需人工清除才能恢复。下拉框里没有 udphop，只能经链接导入触发。**部署后不要粘贴带 `mport=` 的 hysteria2 出站链接。**
+- **每次启动会把 `x-ui.db` 及 `-wal`/`-shm` chmod 成 0600**（`db.go:2811-2820`，v3.7.0 无此函数）。面板以 root 跑不受影响；若有非 root 的备份或监控脚本读该库，会开始报权限错误，且手动 chmod 无效。
+- **迁移硬失败会让面板 `log.Fatalf` 退出**（`main.go:113`），而此时 `systemctl restart` 的 stop 阶段已杀掉旧 cgroup 连同旧 xray，于是 443 一直空着；`Restart=on-failure` 每 5s 重试，180 秒内崩满 10 次后 systemd 放弃（需 `reset-failed`）。因此 restart 后必须立刻查 `is-active` / `journalctl` / `ss -lntp | grep :443`。
+
+#### 四、未覆盖到的部分（不要当成已核实）
+
+**db-migration 维度的复核只完成了 4 条，另有 6 条因会话额度耗尽而复核失败，被直接丢弃——既未站住也未被反驳。** 因此本节关于**数据库迁移可逆性、以及「回退是否只换二进制就够」**这个问题，**尚无可信结论**。已知线索：升级会跑 4 个改写 `xrayTemplateConfig` 的 seeder，且写完 `HistoryOfSeeders` 后永不重跑；另有 `subSortIndex` 在两版间的夹取条件不同。在该问题落定之前，**回退一律按「旧二进制 + 旧库」两步执行**，不要假设只换二进制就能回去。
 
 ### 操作方式的变化
 
